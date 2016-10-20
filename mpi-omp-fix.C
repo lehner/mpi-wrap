@@ -65,12 +65,14 @@ static bool mpi_init;
 //--------------------------------------------------------------------------------
 struct _shm_block {
   int lock;
+  int cmd;
 #define CMD_SEND  0x1
 #define CMD_RECV  0x2
   int status;
-#define STATUS_IDLE 0x0
-#define STATUS_BUSY 0x1
-#define STATUS_DONE 0x2
+#define STATUS_IDLE  0x0
+#define STATUS_START 0x1
+#define STATUS_BUSY  0x2
+#define STATUS_DONE  0x3
   int count;
   MPI_Datatype type;
   int addr;
@@ -99,6 +101,8 @@ static void worker() {
 
     if (cmd == -1)
       break;
+
+    printf("Worker %d received %d\n", worker_id, cmd);
   }
 }
 //--------------------------------------------------------------------------------
@@ -113,18 +117,79 @@ static int next_worker = 0;
 //--------------------------------------------------------------------------------
 static int lock_block() {
   int i;
-  for (i=0;i<block_count;i++) {
-  _shm_block* b = (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * i);
-}
+
+  while (true) {
+    for (i=0;i<block_count;i++) {
+      _shm_block* b = (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * i);
+      if (!b->lock) {
+	b->lock = 1;
+	return i;
+      }
+    }
+
+    printf("Warning: lock_block failed\n");
+    sleep(1);
+  }
+
+  return -1; // no warning
 }
 //--------------------------------------------------------------------------------
 static void release_block(int i) {
+  _shm_block* b = (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * i);
+  if (!b->lock) {
+    fprintf(stderr,"Logic error in release_block\n");
+    exit(5);
+  }
+  b->lock = 0;
 }
 //--------------------------------------------------------------------------------
 static void block_wait(int i) {
+  _shm_block* b = (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * i);
+  while (b->status != STATUS_DONE)
+    usleep(0);
+  b->status = STATUS_IDLE;
 }
 //--------------------------------------------------------------------------------
 static void block_set(int i, int cmd, const void* buf, int count, MPI_Datatype type, int addr, int tag) {
+  _shm_block* b = (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * i);
+
+  if (!b->lock) {
+    fprintf(stderr,"Logic error in block_set\n");
+    exit(5);
+  }
+
+  b->cmd = cmd;
+  b->status = STATUS_START;
+  b->count = count;
+  b->type = type;
+  b->addr = addr;
+  b->tag = tag;
+
+  switch (type) {
+  case MPI_CHAR:
+    b->size = count;
+    break;
+  default:
+    fprintf(stderr,"Type %d not yet implemented\n",type);
+    exit(6);
+  }
+
+  if (b->size > block_size) {
+    fprintf(stderr,"Block limit currently is %d bytes (tried %d)\n",block_size,b->size);
+    exit(7);
+  }
+
+  double t0 = dclock();
+  fast_copy(buf,(char*b) + HEADER_SIZE,b->size);
+  double t1 = dclock();
+
+  if (verbosity > 1) {
+    // TODO: fast_copy and print speed
+  }
+
+  send_to_worker(next_worker,i);
+  next_worker = (next_worker + 1) % (rank_per_node - 1);
+
 }
 //--------------------------------------------------------------------------------
 // Barrier
