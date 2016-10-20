@@ -111,6 +111,48 @@ static void send_to_worker(int worker, int cmd) {
   MPI_Send(&cmd,1,MPI_INT,wid,0,mpi_world);
 }
 //--------------------------------------------------------------------------------
+// Benchmark
+//--------------------------------------------------------------------------------
+inline double dclock() {
+  struct timeval tv;
+  gettimeofday(&tv,NULL);
+  return (1.0*tv.tv_usec + 1.0e6*tv.tv_sec) / 1.0e6;
+}
+//--------------------------------------------------------------------------------
+// Fast copy
+//--------------------------------------------------------------------------------
+#define BLOCK_SIZE (sizeof(float)*16)
+void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
+
+  const float* _src = (float*)src;
+  float* _dst = (float*)dst;
+  
+  int nthreads = omp_get_num_threads();
+  int ithread  = omp_get_thread_num();
+  for (int i=ithread;i<nblocks;i+=nthreads) {
+    __m512 buffer = _mm512_load_ps(_src + i*16);
+    _mm512_stream_ps(_dst + i*16 , buffer);
+  }
+
+}
+//--------------------------------------------------------------------------------
+void fast_copy(char* dst, const char* src, size_t size) {
+
+  size_t nfastblocks = (size - size % BLOCK_SIZE) / BLOCK_SIZE;
+  size_t size_slow = size - nfastblocks * BLOCK_SIZE;
+
+  // start copy threads
+#pragma omp parallel
+  {
+    fast_copy_blocks_threaded(dst,src,nfastblocks);
+  }
+
+  if (size_slow)
+    memcpy(dst + nfastblocks * BLOCK_SIZE,
+	   src + nfastblocks * BLOCK_SIZE, 
+	   size_slow);
+}
+//--------------------------------------------------------------------------------
 // Block management
 //--------------------------------------------------------------------------------
 static int next_worker = 0;
@@ -165,11 +207,11 @@ static void block_set(int i, int cmd, const void* buf, int count, MPI_Datatype t
   b->addr = addr;
   b->tag = tag;
 
-  switch (type) {
-  case MPI_CHAR:
+  if (type == MPI_CHAR) {
     b->size = count;
-    break;
-  default:
+  } else if (type == MPI_DOUBLE) {
+    b->size = count * sizeof(double);
+  } else {
     fprintf(stderr,"Type %d not yet implemented\n",type);
     exit(6);
   }
@@ -180,7 +222,7 @@ static void block_set(int i, int cmd, const void* buf, int count, MPI_Datatype t
   }
 
   double t0 = dclock();
-  fast_copy(buf,(char*b) + HEADER_SIZE,b->size);
+  fast_copy((char*)b + HEADER_SIZE,(const char*)buf,b->size);
   double t1 = dclock();
 
   if (verbosity > 1) {
