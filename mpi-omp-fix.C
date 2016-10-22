@@ -66,12 +66,10 @@ static bool mpi_init;
 //
 // Idea: 
 // - Rank 0 runs MPI program
-// - Rank 1 runs control channel
 // - Rank i runs data channels
 //--------------------------------------------------------------------------------
-#define WORKER_ADDR(node,worker) ( (node) * rank_per_node + 2 + (worker))
-#define WORKERS ( rank_per_node - 2 )
-#define CONTROL_ADDR(node) ( (node) * rank_per_node + 1 )
+#define WORKER_ADDR(node,worker) ( (node) * rank_per_node + 1 + (worker))
+#define WORKERS ( rank_per_node - 1 )
 //--------------------------------------------------------------------------------
 static void _printf(const char* format, ...) {
   va_list args;
@@ -82,16 +80,29 @@ static void _printf(const char* format, ...) {
   printf("[%d,%d]  %s",mpi_node,mpi_id_on_node,buf);
 }
 //--------------------------------------------------------------------------------
-// Shared memory blocks for each worker
+// Shared memory blocks
+// These blocks hold data to be sent by the workers (CMD_SEND) as
+// well as data received from another node (CMD_STORE).  They also
+// mark data that is expected to be received (CMD_RECV).
 //--------------------------------------------------------------------------------
-struct _shm_block {
+struct _mutex {
   pthread_mutex_t lock_mutex;
   pthread_mutexattr_t lock_mutex_attr;
+};
+//--------------------------------------------------------------------------------
+struct _worker_cmd {
+  //_mutex l; // don't need a mutex since only one thread sends commands to me and
+  // only the worker itself can return to the idle state
+  int cmd;
+};
+//--------------------------------------------------------------------------------
+struct _shm_block {
+  _mutex l;
   int lock;
   int cmd;
 #define CMD_SEND  0x1
-#define CMD_RECV  0x2
-#define CMD_RECV_WAIT 0x3
+#define CMD_STORE  0x2
+#define CMD_RECV 0x3
   int status;
 #define STATUS_IDLE  0x0
 #define STATUS_START 0x1
@@ -108,6 +119,7 @@ struct _shm_block {
 };
 #define PAGE_SIZE 4096
 #define HEADER_SIZE PAGE_SIZE
+#define WORKER_COMM_SIZE PAGE_SIZE*2
 static char*  blocks_ptr;
 static size_t block_size;
 static size_t block_count;
@@ -124,7 +136,8 @@ inline double dclock() {
 // Fast copy
 //--------------------------------------------------------------------------------
 #define BLOCK_SIZE (sizeof(float)*16)
-#define GET_BLOCK(i) (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * (i))
+#define GET_BLOCK(i) ( (_shm_block*)(blocks_ptr + WORKER_COMM_SIZE + (block_size + HEADER_SIZE) * (i)) )
+#define GET_WORKER_CMD(i) ( (_worker_cmd*)(blocks_ptr + sizeof(_worker_cmd)*(i) ) )
 //--------------------------------------------------------------------------------
 void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
 
@@ -181,22 +194,22 @@ static void process(int i) {
     b->status = STATUS_DONE;
     _printf("CMD Send done\n");
 
-  } else if (b->cmd == CMD_RECV) {
+  } else if (b->cmd == CMD_STORE) {
 
-    _printf("CMD Receive from %d with tag %d\n",b->addr,b->tag);
+    _printf("CMD Store from %d with tag %d\n",b->addr,b->tag);
 
     b->status = STATUS_BUSY;
     MPI_Status s;
     MPI_Recv((char*)b + HEADER_SIZE,b->count,b->type,b->addr,b->tag,mpi_world,&s);
     b->status = STATUS_DONE;
 
-    _printf("CMD Receive done\n");
+    _printf("CMD Store done\n");
 
-    // Check all local buffers for matching CMD_RECV_WAIT block
+    // Check all local buffers for matching CMD_RECV block
     int j;
     for (j=0;j<block_count;j++) {
       _shm_block* bp = GET_BLOCK(j);
-      if (bp->lock && bp->cmd==CMD_RECV_WAIT &&
+      if (bp->lock && bp->cmd==CMD_RECV &&
 	  match_block_metadata(b,bp)) {
 	bp->block_forward = i;
 	bp->status = STATUS_DONE;
@@ -218,6 +231,11 @@ static void process(int i) {
 //--------------------------------------------------------------------------------
 // Lock a block and assign a worker to it
 //--------------------------------------------------------------------------------
+#define LOCK(l)					\
+  pthread_mutex_lock(&l.lock_mutex);
+#define UNLOCK(l)				\
+  pthread_mutex_unlock(&l.lock_mutex);
+//--------------------------------------------------------------------------------
 static int lock_block() {
   int i;
 
@@ -225,23 +243,21 @@ static int lock_block() {
     for (i=0;i<block_count;i++) {
       _shm_block* b = GET_BLOCK(i);
 
-      pthread_mutex_lock(&b->lock_mutex);
+      LOCK(b->l);
       if (!b->lock) {
 	b->lock = 1;
-
-	pthread_mutex_unlock(&b->lock_mutex);
-
 	b->worker = i;
 	if (i >= WORKERS) {
 	  fprintf(stderr,"Logic error in lock_block, block_count and WORKERS not correctly related\n");
 	  exit(44);
 	}
+	
 
+	UNLOCK(b->l);
 	_printf("lock_block(block = %d, worker = %d)\n",i,b->worker);
 	return i;
       }
-      pthread_mutex_unlock(&b->lock_mutex);
-
+      UNLOCK(b->l);
     }
 
     _printf("Warning: lock_block failed\n");
@@ -282,15 +298,15 @@ static void block_wait(int i) {
   _shm_block* b = GET_BLOCK(i);
 
   // if I should read data, see if it is already here in any of the blocks
-  if (b->cmd == CMD_RECV_WAIT) {
+  if (b->cmd == CMD_RECV) {
 
     int j;
     for (j=0;j<block_count;j++) {
       _shm_block* bp = GET_BLOCK(j);
-      if (bp->lock && bp->cmd==CMD_RECV &&
+      if (bp->lock && bp->cmd==CMD_STORE &&
 	  match_block_metadata(b,bp)) {
 
-	_printf("CMD Receive data was already there\n");
+	_printf("CMD Store data was already there\n");
 	b->block_forward = j;
 	b->status = STATUS_DONE;
 	break;
@@ -305,7 +321,7 @@ static void block_wait(int i) {
 
   b->status = STATUS_IDLE;
 
-  if (b->cmd == CMD_RECV_WAIT) {
+  if (b->cmd == CMD_RECV) {
     _shm_block* bp = GET_BLOCK(b->block_forward);
 
     complete_receive(b,bp);
@@ -317,98 +333,77 @@ static void block_wait(int i) {
 // Worker job
 //--------------------------------------------------------------------------------
 #define WORKER_CMD_QUIT -1
-#define WORKER_CMD_PREPARE_RECEIVE -2
-#define CONTROL_ID -1
+#define WORKER_CMD_IDLE -2
 //--------------------------------------------------------------------------------
-static void prepare_receive(int ret_addr,int* args);
+static int next_worker_to_use = 0;
 //--------------------------------------------------------------------------------
 static void worker() {
-  int worker_id = mpi_id_on_node - 2;
-
+  int worker_id = mpi_id_on_node - 1;
+  _worker_cmd* wc = GET_WORKER_CMD(worker_id);
+      
   int cmd;
   while (1) {
-    MPI_Status s;
 
-    int data[16];
-    MPI_Recv(data,16,MPI_INT,MPI_ANY_SOURCE,0,mpi_world,&s);
-
-    int cmd = data[0];
+    cmd = wc->cmd;
 
     if (cmd == WORKER_CMD_QUIT) {
+      _printf("Received quit signal\n");
       break;
-    } else if (cmd == WORKER_CMD_PREPARE_RECEIVE) {
-      _printf("Received prepare receive\n");
-      prepare_receive(s.MPI_SOURCE,&data[1]);
+    } else if (cmd == WORKER_CMD_IDLE) {
+
+      // can receive data from other nodes
+      MPI_Status s;
+
+      int flag;
+      MPI_Iprobe( MPI_ANY_SOURCE, MPI_ANY_TAG, mpi_world, &flag, &s );
+      
+      if (flag) {
+	
+	int bytes;
+	MPI_Get_count(&s,MPI_CHAR,&bytes);
+
+	_printf("Worker received data:  bytes = %d, source = %d, tag = %d\n",
+		bytes,s.MPI_SOURCE,s.MPI_TAG);
+	
+	// TODO do something with data
+
+	// first see if a block (CMD_RECV) is already waiting for this kind of data
+
+	// if not do a buffered store (CMD_STORE)
+      }
+
     } else {
-      // process block
-      _printf("Being told to take care of block %d\n",cmd);
+
+      // being told to send data in block cmd
       process(cmd);
+
+      wc->cmd = WORKER_CMD_IDLE;
+
     }
 
   }
 }
 //--------------------------------------------------------------------------------
-static void send_to_worker(int node, int worker, int cmd, int* args, int nargs) {
-  int wid = WORKER_ADDR(node,worker);
-  int data[16];
-  data[0] = cmd;
-  if (nargs)
-    memcpy(&data[1],args,nargs*sizeof(int));
+void worker_send_cmd(int wid, int cmd) {
+  _worker_cmd* wc = GET_WORKER_CMD(wid);
+  
+  while (true) {
 
-  _printf("SendToWorker(%d,%d -> %d)\n",node,worker,cmd);
-  MPI_Send(data,16,MPI_INT,wid,0,mpi_world);
-  _printf("SendToWorker done\n");
-}
-//--------------------------------------------------------------------------------
-static void send_to_my_worker(int worker, int cmd, int* args, int nargs) {
-  send_to_worker(mpi_node,worker,cmd,args,nargs);
-}
-//--------------------------------------------------------------------------------
-static int recv_from_worker(int node, int worker) {
-  int wid = WORKER_ADDR(node,worker);
-  int ret;
-  MPI_Status s;
+    if (wc->cmd == WORKER_CMD_IDLE) {
+      wc->cmd = cmd;
+      return;
+    }
 
-  _printf("RecvFromWorker(%d,%d)\n",node,worker);
-  MPI_Recv(&ret,1,MPI_INT,wid,0,mpi_world,&s);
-  _printf("RecvFromWorker done\n");
-  return ret;
-}
-//--------------------------------------------------------------------------------
-// prepare to receive data from send_addr, return our worker addr to ret_addr
-//--------------------------------------------------------------------------------
-static void prepare_receive(int ret_addr,int* data) {
-  int i = lock_block();
-  _shm_block* b = GET_BLOCK(i);
-  b->cmd = CMD_RECV;
-  b->addr = data[0];
-  b->count = data[1];
-  b->type = (MPI_Datatype)data[2];
-  b->tag = data[3];
+    usleep(0);
 
-  _printf("%d tells us that we will get data from %d, count = %d, tag = %d\n",
-	 ret_addr,
-	 b->addr,b->count,b->tag);
+  }
 
-  int wid = WORKER_ADDR(mpi_node,b->worker);
-  send_to_my_worker(b->worker,i,0,0);
-  MPI_Send(&wid,1,MPI_INT,ret_addr,0,mpi_world);
-
-  _printf("done\n");
 }
 //--------------------------------------------------------------------------------
 // Send to target node that worker node will transfer data, learn which target
 // address to use
 //--------------------------------------------------------------------------------
-static int prepare_target_node_for_incoming_data(int target,int our_worker_addr,
-						 int count, MPI_Datatype type, int tag) {
-
-  int data[] = { our_worker_addr, count, *(int*)&type, tag };
-  send_to_worker(target,CONTROL_ID,WORKER_CMD_PREPARE_RECEIVE,data,4);
-  return recv_from_worker(target,CONTROL_ID);
-}
-//--------------------------------------------------------------------------------
-static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, int addr, int tag) {
+static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, int node, int tag) {
   _shm_block* b = GET_BLOCK(i);
 
   if (!b->lock) {
@@ -438,6 +433,11 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
 
   if (b->cmd == CMD_SEND) {
 
+    _printf("CMD_SEND\n");
+
+    int* itype = (int*)((char*)b + HEADER_SIZE - 4);
+    *itype = *(int*)&type;
+
     double t0 = dclock();
     fast_copy((char*)b + HEADER_SIZE,(const char*)buf,b->size);
     double t1 = dclock();
@@ -445,23 +445,23 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
     //if (verbosity > 1) {
     {
       double size_in_gb = (double)b->size / 1024. / 1024. / 1024.;
-      //_printf("SEND Fast-copy %g GB/s total %g GB for worker %d, target %d\n",
-      //     size_in_gb / (t1-t0), size_in_gb,b->worker,addr);
+      _printf("SEND Fast-copy %g GB/s total %g GB for worker %d, target %d\n",
+           size_in_gb / (t1-t0), size_in_gb,b->worker,node);
     }
 
-    _printf("SEND Asking about where to send stuff\n");
-    int target_addr = 
-      prepare_target_node_for_incoming_data(addr,
-					    WORKER_ADDR(mpi_node,b->worker),
-					    count,type,tag);
-    _printf("SEND Answer: Send to %d\n",target_addr);
-    b->addr = target_addr;
-    send_to_my_worker(b->worker,i,0,0);
+    b->worker = next_worker_to_use;
+    b->addr = WORKER_ADDR(node,b->worker + 1); // +1 to get the corresponding recv worker
+
+    worker_send_cmd(b->worker,i);
+
+    // only use even workers for send, odd to receive
+    next_worker_to_use = (next_worker_to_use + 2) % WORKERS;
 
     _printf("SEND Sent send command to worker %d\n",b->worker);
 
-  } else if (b->cmd == CMD_RECV_WAIT) {
+  } else if (b->cmd == CMD_RECV) {
     b->head_addr = buf; // remember where to copy stuff
+    b->addr = node;
   }
   
 }
@@ -509,7 +509,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
   _printf("Node %d MPI_Irecv(source = %d,tag = %d)\n",mpi_node,source,tag);
 
   int i = lock_block();
-  block_set(i, CMD_RECV_WAIT, buf, count, datatype, source, tag);
+  block_set(i, CMD_RECV, buf, count, datatype, source, tag);
   *(int*)request = i;
 
   return 0;
@@ -556,7 +556,7 @@ static void shm_init() {
 
   key_t          k;
 
-  size_t total_size = block_count * (block_size + HEADER_SIZE);
+  size_t total_size = block_count * (block_size + HEADER_SIZE) + WORKER_COMM_SIZE;
 
   k = 0x7f7d + mpi_node; //ftok(".", 'x');
 
@@ -583,29 +583,43 @@ static void shm_init() {
 	    total_size,mpi_id);
     exit(4);
   }
+  
+#define LOCK_CREATE(l)							\
+  pthread_mutexattr_init(&l.lock_mutex_attr);				\
+  pthread_mutexattr_setpshared(&l.lock_mutex_attr, PTHREAD_PROCESS_SHARED); \
+  pthread_mutex_init(&l.lock_mutex,&l.lock_mutex_attr);
+
+#define LOCK_DESTROY(l)					\
+  pthread_mutex_destroy(&l.lock_mutex);			\
+  pthread_mutexattr_destroy(&l.lock_mutex_attr); 
 
   // touch memory
   //_printf("Before\n");
   if (!mpi_id_on_node) {
     memset(blocks_ptr,0,total_size);
-    for (int i=0;i<block_count;i++) {
+    int i;
+    for (i=0;i<block_count;i++) {
       _shm_block* b = GET_BLOCK(i);
-      pthread_mutexattr_init(&b->lock_mutex_attr);
-      pthread_mutexattr_setpshared(&b->lock_mutex_attr, PTHREAD_PROCESS_SHARED);
-      pthread_mutex_init(&b->lock_mutex,&b->lock_mutex_attr);
+      LOCK_CREATE(b->l);
+    }
+    for (i=0;i<WORKERS;i++) {
+      _worker_cmd* wc = GET_WORKER_CMD(i);
+      wc->cmd = WORKER_CMD_IDLE;
     }
   }
   //_printf("After\n");
-
+  
+  // wait until shared memory is initialized
+  real_MPI_Barrier(mpi_world);
 }
 //--------------------------------------------------------------------------------
 static void shm_exit() {
 
   if (!mpi_id_on_node) {
-    for (int i=0;i<block_count;i++) {
+    int i;
+    for (i=0;i<block_count;i++) {
       _shm_block* b = GET_BLOCK(i);
-      pthread_mutex_destroy(&b->lock_mutex);
-      pthread_mutexattr_destroy(&b->lock_mutex_attr); 
+      LOCK_DESTROY(b->l);
     }
   }
 
@@ -742,6 +756,12 @@ extern "C" int __libc_start_main(void* func_ptr,
   block_count = WORKERS;
   block_size = 16*1024*PAGE_SIZE;
 
+  // need an even number of workers (one for send, one for receive)
+  if (WORKERS % 2) {
+    fprintf(stderr,"Need even number of workers (workers = %d)\n",WORKERS);
+    exit(4);
+  }
+
   // create shared memory
   shm_init();
 
@@ -787,9 +807,10 @@ int MPI_Finalize( void ) {
     return -1;
 
   int i;
-  for (i=-1;i<WORKERS;i++)
-    send_to_my_worker(i,WORKER_CMD_QUIT,0,0); // tell worker to quit
-  
+  for (i=0;i<WORKERS;i++) {
+    worker_send_cmd(i,WORKER_CMD_QUIT);
+  }
+
   real_MPI_Finalize();
   shm_exit();
 
