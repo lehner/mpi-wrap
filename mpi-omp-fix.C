@@ -174,16 +174,31 @@ void fast_copy(char* dst, const char* src, size_t size) {
 //--------------------------------------------------------------------------------
 #define ADDR_NODE(addr)  ( (int)( addr / rank_per_node ) )
 //--------------------------------------------------------------------------------
-bool match_block_metadata(_shm_block* A, _shm_block* B) {
+static int type_size(MPI_Datatype t) {
+
+  if (t == MPI_CHAR) {
+    return 1;
+  } else if (t==MPI_DOUBLE) {
+    return 8;
+  } else if (t==MPI_FLOAT) {
+    return 4;
+  } else if (t==MPI_INT) {
+    return 4;
+  } else {
+    fprintf(stderr,"Unknown data-type: %d\n",*(int*)&t);
+    exit(5);
+  }
+}
+//--------------------------------------------------------------------------------
+static bool match_block_metadata(_shm_block* A, _shm_block* B) {
   return A->tag == B->tag &&
-    A->count == B->count &&
-    A->type == B->type &&
+    A->size == B->size &&
     ADDR_NODE(A->addr) == ADDR_NODE(B->addr);
 }
 //--------------------------------------------------------------------------------
-// Process block
+// Process send
 //--------------------------------------------------------------------------------
-static void process(int i) {
+static void process_send(int i) {
   _shm_block* b = GET_BLOCK(i);
 
   if (b->cmd == CMD_SEND) {
@@ -193,33 +208,6 @@ static void process(int i) {
     MPI_Send((char*)b + HEADER_SIZE,b->count,b->type,b->addr,b->tag,mpi_world);
     b->status = STATUS_DONE;
     _printf("CMD Send done\n");
-
-  } else if (b->cmd == CMD_STORE) {
-
-    _printf("CMD Store from %d with tag %d\n",b->addr,b->tag);
-
-    b->status = STATUS_BUSY;
-    MPI_Status s;
-    MPI_Recv((char*)b + HEADER_SIZE,b->count,b->type,b->addr,b->tag,mpi_world,&s);
-    b->status = STATUS_DONE;
-
-    _printf("CMD Store done\n");
-
-    // Check all local buffers for matching CMD_RECV block
-    int j;
-    for (j=0;j<block_count;j++) {
-      _shm_block* bp = GET_BLOCK(j);
-      if (bp->lock && bp->cmd==CMD_RECV &&
-	  match_block_metadata(b,bp)) {
-	bp->block_forward = i;
-	bp->status = STATUS_DONE;
-
-	_printf("CMD Receive block %d was already waiting\n",j);
-	break;
-      }
-    }
-
-    _printf("Data received but no one waiting!\n");
 
   } else {
 
@@ -297,37 +285,60 @@ void complete_receive(_shm_block* b, _shm_block* bp) {
 static void block_wait(int i) {
   _shm_block* b = GET_BLOCK(i);
 
-  // if I should read data, see if it is already here in any of the blocks
-  if (b->cmd == CMD_RECV) {
+  while (b->status != STATUS_DONE) {
+    usleep(10000);
 
-    int j;
-    for (j=0;j<block_count;j++) {
-      _shm_block* bp = GET_BLOCK(j);
-      if (bp->lock && bp->cmd==CMD_STORE &&
-	  match_block_metadata(b,bp)) {
+    // if I should read data, see if it is already here in any of the blocks
+    if (b->cmd == CMD_RECV) {
+      
+      int j;
+      for (j=0;j<block_count;j++) {
+	_shm_block* bp = GET_BLOCK(j);
+	if (bp->lock && bp->cmd==CMD_STORE) {
+	  _printf("Test block: STORE tag(%d,%d), addr(%d,%d) size(%d,%d)\n",b->tag,bp->tag,ADDR_NODE(b->addr),ADDR_NODE(bp->addr),
+		  b->size,bp->size);
+	}
 
-	_printf("CMD Store data was already there\n");
-	b->block_forward = j;
-	b->status = STATUS_DONE;
-	break;
-      }
+	if (bp->lock && bp->cmd==CMD_STORE &&
+	    match_block_metadata(b,bp)) {
+
+	  _printf("Found matching CMD_STORE!\n");
+
+	  complete_receive(b,bp);
+
+	  release_block(j); // release the store block
+	  return;
+	}
+      }      
     }
 
-  }
-
-  while (b->status != STATUS_DONE) {
-    usleep(0);
+    _printf("Wait Block %d (%d,%d)\n",i,b->cmd,b->status);
   }
 
   b->status = STATUS_IDLE;
+}
+//--------------------------------------------------------------------------------
+// Process receive
+//--------------------------------------------------------------------------------
+static void process_recv(int bytes, int source, int tag) {
 
-  if (b->cmd == CMD_RECV) {
-    _shm_block* bp = GET_BLOCK(b->block_forward);
+  int i = lock_block();
 
-    complete_receive(b,bp);
+  _shm_block* b = GET_BLOCK(i);
+  b->addr = source;
+  b->tag = tag;
+  b->size = bytes;
+  b->cmd = CMD_STORE;
 
-    release_block(b->block_forward);
-  }
+  _printf("CMD Store from %d with tag %d\n",b->addr,b->tag);
+
+  b->status = STATUS_BUSY;
+  MPI_Status s;
+  MPI_Recv((char*)b + HEADER_SIZE,b->size,MPI_CHAR,b->addr,b->tag,mpi_world,&s);
+  b->status = STATUS_DONE;
+
+  _printf("CMD Store done in block %d\n",i);
+
 }
 //--------------------------------------------------------------------------------
 // Worker job
@@ -362,20 +373,13 @@ static void worker() {
 	int bytes;
 	MPI_Get_count(&s,MPI_CHAR,&bytes);
 
-	_printf("Worker received data:  bytes = %d, source = %d, tag = %d\n",
-		bytes,s.MPI_SOURCE,s.MPI_TAG);
-	
-	// TODO do something with data
-
-	// first see if a block (CMD_RECV) is already waiting for this kind of data
-
-	// if not do a buffered store (CMD_STORE)
+	process_recv(bytes,s.MPI_SOURCE,s.MPI_TAG);
       }
 
     } else {
 
       // being told to send data in block cmd
-      process(cmd);
+      process_send(cmd);
 
       wc->cmd = WORKER_CMD_IDLE;
 
@@ -395,6 +399,9 @@ void worker_send_cmd(int wid, int cmd) {
     }
 
     usleep(0);
+
+    // STALL HERE
+    //_printf("worker %d stalling before cmd\n",wid,cmd);
 
   }
 
@@ -417,14 +424,7 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
   b->type = type;
   b->tag = tag;
 
-  if (type == MPI_CHAR) {
-    b->size = count;
-  } else if (type == MPI_DOUBLE) {
-    b->size = count * sizeof(double);
-  } else {
-    fprintf(stderr,"Type %d not yet implemented\n",type);
-    exit(6);
-  }
+  b->size = count*type_size(type);
 
   if (b->size > block_size) {
     fprintf(stderr,"Block limit currently is %d bytes (tried %d)\n",block_size,b->size);
@@ -434,9 +434,6 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
   if (b->cmd == CMD_SEND) {
 
     _printf("CMD_SEND\n");
-
-    int* itype = (int*)((char*)b + HEADER_SIZE - 4);
-    *itype = *(int*)&type;
 
     double t0 = dclock();
     fast_copy((char*)b + HEADER_SIZE,(const char*)buf,b->size);
@@ -461,7 +458,7 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
 
   } else if (b->cmd == CMD_RECV) {
     b->head_addr = buf; // remember where to copy stuff
-    b->addr = node;
+    b->addr = node * rank_per_node;
   }
   
 }
