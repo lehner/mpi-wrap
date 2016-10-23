@@ -208,6 +208,8 @@ static void process_send(int i) {
     b->status = STATUS_BUSY;
     MPI_Send((char*)b + HEADER_SIZE,b->count,b->type,b->addr,b->tag,mpi_world);
     b->status = STATUS_DONE;
+
+    _printf("Sent data\n");
     //_printf("CMD Send done\n");
 
   } else {
@@ -268,26 +270,26 @@ static void release_block(int i) {
   UNLOCK(b->l);
 }
 //--------------------------------------------------------------------------------
-void complete_receive(_shm_block* b, _shm_block* bp) {
+static void complete_receive(_shm_block* b, _shm_block* bp) {
 
-    double t0 = dclock();
-    fast_copy((char*)b->head_addr,(char*)bp + HEADER_SIZE,b->size);
-    double t1 = dclock();
-    
-    //if (verbosity > 1) {
-    {
-      double size_in_gb = (double)b->size / 1024. / 1024. / 1024.;
-      //_printf("Fast-copy (RECV) %g GB/s total %g GB\n",
-      //   size_in_gb / (t1-t0), size_in_gb);
-    }
-
+  double t0 = dclock();
+  fast_copy((char*)b->head_addr,(char*)bp + HEADER_SIZE,b->size);
+  double t1 = dclock();
+  
+  //if (verbosity > 1) {
+  {
+    double size_in_gb = (double)b->size / 1024. / 1024. / 1024.;
+    //_printf("Fast-copy (RECV) %g GB/s total %g GB\n",
+    //   size_in_gb / (t1-t0), size_in_gb);
+  }
+  
 }
 //--------------------------------------------------------------------------------
 static void block_wait(int i) {
   _shm_block* b = GET_BLOCK(i);
 
   while (b->status != STATUS_DONE) {
-    usleep(10);
+    usleep(0);
 
     // if I should read data, see if it is already here in any of the blocks
     if (b->cmd == CMD_RECV) {
@@ -296,10 +298,12 @@ static void block_wait(int i) {
       for (j=0;j<block_count;j++) {
 	_shm_block* bp = GET_BLOCK(j);
 
-	//if (bp->lock && bp->cmd==CMD_STORE) {
-	//  _printf("Test block: STORE tag(%d,%d), addr(%d,%d) size(%d,%d)\n",b->tag,bp->tag,ADDR_NODE(b->addr),ADDR_NODE(bp->addr),
-	//	  b->size,bp->size);
-	//}
+	//_printf("Block %d %d %d\n",j,bp->lock,bp->cmd);
+
+	/*if (bp->lock && bp->cmd==CMD_STORE) {
+	  _printf("Test block: STORE tag(%d,%d), addr(%d,%d) size(%d,%d)\n",b->tag,bp->tag,ADDR_NODE(b->addr),ADDR_NODE(bp->addr),
+		  b->size,bp->size);
+		  }*/
 
 	if (bp->lock && bp->cmd==CMD_STORE &&
 	    match_block_metadata(b,bp)) {
@@ -337,21 +341,26 @@ static void process_recv(int bytes, int source, int tag) {
   for (j=0;j<block_count;j++) {
     _shm_block* bp = GET_BLOCK(j);
 
-    if (bp->lock && bp->cmd==CMD_RECV &&
+    LOCK(bp->l);
+    if (bp->lock && bp->status == STATUS_START &&
+	bp->cmd==CMD_RECV &&
 	bp->size == bytes && 
 	ADDR_NODE(source) == ADDR_NODE(bp->addr) &&
 	bp->tag == tag) {
 
+      bp->status = STATUS_BUSY;
+      UNLOCK(bp->l);
       //_printf("FOUND WAITING\n");
       b = bp;
       break;
     }
+    UNLOCK(bp->l);
   }
 
   if (j == block_count) {
-    int i = lock_block();
+    j = lock_block();
     
-    b = GET_BLOCK(i);
+    b = GET_BLOCK(j);
     b->addr = source;
     b->tag = tag;
     b->size = bytes;
@@ -363,6 +372,7 @@ static void process_recv(int bytes, int source, int tag) {
   b->status = STATUS_BUSY;
   MPI_Status s;
   MPI_Recv((char*)b + HEADER_SIZE,b->size,MPI_CHAR,source,b->tag,mpi_world,&s);
+  _printf("Received data in block %d (%d)\n",j,b->cmd);
   b->status = STATUS_DONE;
 
 }
@@ -546,13 +556,13 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 
   int i = *(int*)request;
 
-  _printf("MPI_Wait start (%d)\n",GET_BLOCK(i)->cmd);
+  _printf("MPI_Wait start (%d:%d)\n",i,GET_BLOCK(i)->cmd);
 
   double t0 = dclock();
   block_wait(i);
 
   double t1 = dclock();
-  _printf("MPI_Wait complete (%d, t=%g)\n",GET_BLOCK(i)->cmd,t1-t0);
+  _printf("MPI_Wait complete (%d:%d, t=%g)\n",i,GET_BLOCK(i)->cmd,t1-t0);
   release_block(i);
 
   return 0;
@@ -693,9 +703,6 @@ static int _main(int argc, char* argv[], char* env[]) {
   real_MPI_Comm_size(mpi_world,&mpi_n);
   real_MPI_Comm_rank(mpi_world,&mpi_id);
 
-  // init my rank communicator
-  MPI_Comm_split(mpi_world,mpi_id_on_node,mpi_id,&mpi_myrank);
-
   // query openmp
 #pragma omp parallel
   {
@@ -739,6 +746,9 @@ static int _main(int argc, char* argv[], char* env[]) {
   mpi_id_on_node = mpi_id % rank_per_node;
   mpi_node_boss_id = mpi_node * rank_per_node;
 
+  // init my rank communicator
+  MPI_Comm_split(mpi_world,mpi_id_on_node,mpi_id,&mpi_myrank);
+
   // debug output
   if (verbosity > 0) {
     
@@ -770,6 +780,7 @@ static int _main(int argc, char* argv[], char* env[]) {
     if (verbosity > 0 && !mpi_node)
       _printf("MPI-FIX:  Exit %d / %d\n",mpi_id,mpi_n);
 
+    MPI_Comm_free(&mpi_myrank);
     real_MPI_Finalize();
     shm_exit();
     exit(0); // needed since __libc_start_main is never called
@@ -854,16 +865,14 @@ int MPI_Finalize( void ) {
   if (!mpi_init)
     return -1;
 
-  _printf("Finalize\n");
-  //real_MPI_Barrier(mpi_myrank);
-
-  sleep(10);
+  real_MPI_Barrier(mpi_myrank);
 
   int i;
   for (i=0;i<WORKERS;i++) {
     worker_send_cmd(i,WORKER_CMD_QUIT);
   }
 
+  MPI_Comm_free(&mpi_myrank);
   real_MPI_Finalize();
   shm_exit();
 
