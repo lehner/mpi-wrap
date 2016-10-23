@@ -50,6 +50,7 @@ int (* real___libc_start_main)(void *func_ptr,
 // Global variables
 //--------------------------------------------------------------------------------
 static MPI_Comm mpi_world;
+static MPI_Comm mpi_myrank;
 static int mpi_thread_provided;
 static int mpi_id;
 static int mpi_n;
@@ -203,11 +204,11 @@ static void process_send(int i) {
 
   if (b->cmd == CMD_SEND) {
 
-    _printf("CMD Send to %d with tag %d\n",b->addr,b->tag);
+    //_printf("CMD Send to %d with tag %d\n",b->addr,b->tag);
     b->status = STATUS_BUSY;
     MPI_Send((char*)b + HEADER_SIZE,b->count,b->type,b->addr,b->tag,mpi_world);
     b->status = STATUS_DONE;
-    _printf("CMD Send done\n");
+    //_printf("CMD Send done\n");
 
   } else {
 
@@ -242,7 +243,7 @@ static int lock_block() {
 	
 
 	UNLOCK(b->l);
-	_printf("lock_block(block = %d, worker = %d)\n",i,b->worker);
+	//_printf("lock_block(block = %d, worker = %d)\n",i,b->worker);
 	return i;
       }
       UNLOCK(b->l);
@@ -257,17 +258,17 @@ static int lock_block() {
 //--------------------------------------------------------------------------------
 static void release_block(int i) {
   _shm_block* b = GET_BLOCK(i);
+  LOCK(b->l);
   if (!b->lock) {
     fprintf(stderr,"Logic error in release_block\n");
     exit(5);
   }
-  _printf("release_block(%d)\n",i);
+  //_printf("release_block(%d)\n",i);
   b->lock = 0;
+  UNLOCK(b->l);
 }
 //--------------------------------------------------------------------------------
 void complete_receive(_shm_block* b, _shm_block* bp) {
-
-  _printf("Complete receive\n");
 
     double t0 = dclock();
     fast_copy((char*)b->head_addr,(char*)bp + HEADER_SIZE,b->size);
@@ -277,7 +278,7 @@ void complete_receive(_shm_block* b, _shm_block* bp) {
     {
       double size_in_gb = (double)b->size / 1024. / 1024. / 1024.;
       //_printf("Fast-copy (RECV) %g GB/s total %g GB\n",
-      //     size_in_gb / (t1-t0), size_in_gb);
+      //   size_in_gb / (t1-t0), size_in_gb);
     }
 
 }
@@ -286,7 +287,7 @@ static void block_wait(int i) {
   _shm_block* b = GET_BLOCK(i);
 
   while (b->status != STATUS_DONE) {
-    usleep(10000);
+    usleep(10);
 
     // if I should read data, see if it is already here in any of the blocks
     if (b->cmd == CMD_RECV) {
@@ -294,15 +295,16 @@ static void block_wait(int i) {
       int j;
       for (j=0;j<block_count;j++) {
 	_shm_block* bp = GET_BLOCK(j);
-	if (bp->lock && bp->cmd==CMD_STORE) {
-	  _printf("Test block: STORE tag(%d,%d), addr(%d,%d) size(%d,%d)\n",b->tag,bp->tag,ADDR_NODE(b->addr),ADDR_NODE(bp->addr),
-		  b->size,bp->size);
-	}
+
+	//if (bp->lock && bp->cmd==CMD_STORE) {
+	//  _printf("Test block: STORE tag(%d,%d), addr(%d,%d) size(%d,%d)\n",b->tag,bp->tag,ADDR_NODE(b->addr),ADDR_NODE(bp->addr),
+	//	  b->size,bp->size);
+	//}
 
 	if (bp->lock && bp->cmd==CMD_STORE &&
 	    match_block_metadata(b,bp)) {
 
-	  _printf("Found matching CMD_STORE!\n");
+	  //_printf("Found matching CMD_STORE!\n");
 
 	  complete_receive(b,bp);
 
@@ -312,7 +314,13 @@ static void block_wait(int i) {
       }      
     }
 
-    _printf("Wait Block %d (%d,%d)\n",i,b->cmd,b->status);
+    //_printf("Wait Block %d (%d,%d)\n",i,b->cmd,b->status);
+  }
+
+  if (b->cmd == CMD_RECV) {
+    // this can happen if worker found CMD_RECV waiting and directly copied
+    // results to this block
+    complete_receive(b,b);
   }
 
   b->status = STATUS_IDLE;
@@ -322,22 +330,40 @@ static void block_wait(int i) {
 //--------------------------------------------------------------------------------
 static void process_recv(int bytes, int source, int tag) {
 
-  int i = lock_block();
+  _shm_block* b;
 
-  _shm_block* b = GET_BLOCK(i);
-  b->addr = source;
-  b->tag = tag;
-  b->size = bytes;
-  b->cmd = CMD_STORE;
+  // variant 1) find matching receive block
+  int j;
+  for (j=0;j<block_count;j++) {
+    _shm_block* bp = GET_BLOCK(j);
 
-  _printf("CMD Store from %d with tag %d\n",b->addr,b->tag);
+    if (bp->lock && bp->cmd==CMD_RECV &&
+	bp->size == bytes && 
+	ADDR_NODE(source) == ADDR_NODE(bp->addr) &&
+	bp->tag == tag) {
+
+      //_printf("FOUND WAITING\n");
+      b = bp;
+      break;
+    }
+  }
+
+  if (j == block_count) {
+    int i = lock_block();
+    
+    b = GET_BLOCK(i);
+    b->addr = source;
+    b->tag = tag;
+    b->size = bytes;
+    b->cmd = CMD_STORE;
+
+    //_printf("CMD Store from %d with tag %d\n",b->addr,b->tag);
+  }
 
   b->status = STATUS_BUSY;
   MPI_Status s;
-  MPI_Recv((char*)b + HEADER_SIZE,b->size,MPI_CHAR,b->addr,b->tag,mpi_world,&s);
+  MPI_Recv((char*)b + HEADER_SIZE,b->size,MPI_CHAR,source,b->tag,mpi_world,&s);
   b->status = STATUS_DONE;
-
-  _printf("CMD Store done in block %d\n",i);
 
 }
 //--------------------------------------------------------------------------------
@@ -433,7 +459,7 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
 
   if (b->cmd == CMD_SEND) {
 
-    _printf("CMD_SEND\n");
+    //_printf("CMD_SEND\n");
 
     double t0 = dclock();
     fast_copy((char*)b + HEADER_SIZE,(const char*)buf,b->size);
@@ -442,8 +468,8 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
     //if (verbosity > 1) {
     {
       double size_in_gb = (double)b->size / 1024. / 1024. / 1024.;
-      _printf("SEND Fast-copy %g GB/s total %g GB for worker %d, target %d\n",
-           size_in_gb / (t1-t0), size_in_gb,b->worker,node);
+      //_printf("SEND Fast-copy %g GB/s total %g GB for worker %d, target %d\n",
+      //   size_in_gb / (t1-t0), size_in_gb,b->worker,node);
     }
 
     b->worker = next_worker_to_use;
@@ -454,7 +480,7 @@ static void block_set(int i, int cmd, void* buf, int count, MPI_Datatype type, i
     // only use even workers for send, odd to receive
     next_worker_to_use = (next_worker_to_use + 2) % WORKERS;
 
-    _printf("SEND Sent send command to worker %d\n",b->worker);
+    //_printf("SEND Sent send command to worker %d\n",b->worker);
 
   } else if (b->cmd == CMD_RECV) {
     b->head_addr = buf; // remember where to copy stuff
@@ -484,7 +510,7 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int t
     exit(4);
   }
 
-  _printf("Node %d MPI_Isend(dest = %d,tag = %d)\n",mpi_node,dest,tag);
+  //_printf("Node %d MPI_Isend(dest = %d,tag = %d)\n",mpi_node,dest,tag);
 
   int i = lock_block();
   block_set(i, CMD_SEND, (void*)buf, count, datatype, dest, tag);
@@ -503,7 +529,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
     exit(4);
   }
   
-  _printf("Node %d MPI_Irecv(source = %d,tag = %d)\n",mpi_node,source,tag);
+  //_printf("Node %d MPI_Irecv(source = %d,tag = %d)\n",mpi_node,source,tag);
 
   int i = lock_block();
   block_set(i, CMD_RECV, buf, count, datatype, source, tag);
@@ -516,10 +542,17 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
 //--------------------------------------------------------------------------------
 int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 
+
+
   int i = *(int*)request;
+
+  _printf("MPI_Wait start (%d)\n",GET_BLOCK(i)->cmd);
+
+  double t0 = dclock();
   block_wait(i);
 
-  _printf("MPI_Wait complete (%d)\n",i);
+  double t1 = dclock();
+  _printf("MPI_Wait complete (%d, t=%g)\n",GET_BLOCK(i)->cmd,t1-t0);
   release_block(i);
 
   return 0;
@@ -651,51 +684,17 @@ void debug_thread_mapping() {
 //--------------------------------------------------------------------------------
 // Startup wrapper
 //--------------------------------------------------------------------------------
-extern "C" int __libc_start_main(void* func_ptr,
-				 int argc,
-				 char* argv[],
-				 void (*init_func)(void),
-				 void (*fini_func)(void),
-				 void (*rtld_fini_func)(void),
-				 void *stack_end) {
-  
-
-#define LOAD(s) *((void**)&real_ ## s) = dlsym(RTLD_NEXT, #s); if (!real_ ## s) { fprintf(stderr,"MPI-OMP-FIX: Could not find %s\n", #s); return false; }
-
-  // load real implementations
-  LOAD(MPI_Init_thread);
-  LOAD(MPI_Init);
-  LOAD(MPI_Isend);
-  LOAD(MPI_Irecv);
-  LOAD(MPI_Wait);
-  LOAD(MPI_Barrier);
-  LOAD(MPI_Sendrecv);
-  LOAD(MPI_Comm_size);
-  LOAD(MPI_Comm_rank);
-  LOAD(MPI_Finalize);
-  LOAD(__libc_start_main);
-
-  // defaults
-  mpi_init = true;
-
-  // get communicators
-#ifdef OMPI_MPI_COUNT_TYPE
-  // have openmpi
-  {
-    mpi_world = (MPI_Comm)dlsym(RTLD_DEFAULT, "ompi_mpi_comm_world");
-    if (!mpi_world) {
-      fprintf(stderr,"Could not locate openmpi world communicator\n");
-      exit(1);
-    }
-  }
-#else
-  mpi_world = MPI_COMM_WORLD;
-#endif
+static int (* real_main)(int argc, char* argv[], char* env[]);
+//--------------------------------------------------------------------------------
+static int _main(int argc, char* argv[], char* env[]) {
 
   // init and query mpi
   real_MPI_Init_thread(&argc,&argv,MPI_THREAD_MULTIPLE,&mpi_thread_provided);
   real_MPI_Comm_size(mpi_world,&mpi_n);
   real_MPI_Comm_rank(mpi_world,&mpi_id);
+
+  // init my rank communicator
+  MPI_Comm_split(mpi_world,mpi_id_on_node,mpi_id,&mpi_myrank);
 
   // query openmp
 #pragma omp parallel
@@ -705,6 +704,8 @@ extern "C" int __libc_start_main(void* func_ptr,
       nthreads = omp_get_num_threads();
     }
   }
+
+  _printf("Running on %d threads\n",nthreads);
 
   // test environment
   {
@@ -763,7 +764,7 @@ extern "C" int __libc_start_main(void* func_ptr,
   shm_init();
 
   if (!mpi_id_on_node) {
-    return real___libc_start_main(func_ptr,argc,argv,init_func,fini_func,rtld_fini_func,stack_end);
+    return real_main(argc,argv,env);
   } else {
     worker();
     if (verbosity > 0 && !mpi_node)
@@ -774,6 +775,54 @@ extern "C" int __libc_start_main(void* func_ptr,
     exit(0); // needed since __libc_start_main is never called
     return 0; // no warning
   }
+
+}
+//--------------------------------------------------------------------------------
+extern "C" int __libc_start_main(int (* func_ptr)(int argc, char* argv[], char* env[]),
+				 int argc,
+				 char* argv[],
+				 void (*init_func)(void),
+				 void (*fini_func)(void),
+				 void (*rtld_fini_func)(void),
+				 void *stack_end) {
+  
+
+#define LOAD(s) *((void**)&real_ ## s) = dlsym(RTLD_NEXT, #s); if (!real_ ## s) { fprintf(stderr,"MPI-OMP-FIX: Could not find %s\n", #s); return false; }
+
+  // real main
+  real_main = func_ptr;
+
+  // load real implementations
+  LOAD(MPI_Init_thread);
+  LOAD(MPI_Init);
+  LOAD(MPI_Isend);
+  LOAD(MPI_Irecv);
+  LOAD(MPI_Wait);
+  LOAD(MPI_Barrier);
+  LOAD(MPI_Sendrecv);
+  LOAD(MPI_Comm_size);
+  LOAD(MPI_Comm_rank);
+  LOAD(MPI_Finalize);
+  LOAD(__libc_start_main);
+
+  // defaults
+  mpi_init = true;
+
+  // get communicators
+#ifdef OMPI_MPI_COUNT_TYPE
+  // have openmpi
+  {
+    mpi_world = (MPI_Comm)dlsym(RTLD_DEFAULT, "ompi_mpi_comm_world");
+    if (!mpi_world) {
+      fprintf(stderr,"Could not locate openmpi world communicator\n");
+      exit(1);
+    }
+  }
+#else
+  mpi_world = MPI_COMM_WORLD;
+#endif
+
+  return real___libc_start_main((void*)_main,argc,argv,init_func,fini_func,rtld_fini_func,stack_end);
 }
 //--------------------------------------------------------------------------------
 // Trivial functions
@@ -781,10 +830,12 @@ extern "C" int __libc_start_main(void* func_ptr,
 int MPI_Init_thread( int *argc, char ***argv, int required, int *provided ) {
   if (provided)
     *provided = mpi_thread_provided;
+  _printf("Init_thread called\n");
   return 0;
 }
 //--------------------------------------------------------------------------------
 int MPI_Init( int *argc, char ***argv ) {
+  _printf("Init called\n");
   return 0;
 }
 //--------------------------------------------------------------------------------
@@ -802,6 +853,11 @@ int MPI_Finalize( void ) {
 
   if (!mpi_init)
     return -1;
+
+  _printf("Finalize\n");
+  //real_MPI_Barrier(mpi_myrank);
+
+  sleep(10);
 
   int i;
   for (i=0;i<WORKERS;i++) {
