@@ -125,6 +125,7 @@ struct _shm_block {
 struct _receive_tag {
   _packet_type p;
   void* buf;
+  double t0; // timestamp of submission
 };
 std::set<_receive_tag*> recv_tags;
 //--------------------------------------------------------------------------------
@@ -228,7 +229,7 @@ static void complete_receive(_shm_block* b, void* buf) {
   
   //if (verbosity > 1) {
   {
-    double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
+    //double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
     //_printf("Fast-copy (RECV) %g GB/s total %g GB\n",
     //   size_in_gb / (t1-t0), size_in_gb);
   }
@@ -435,6 +436,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
   _receive_tag* t = new _receive_tag();
   t->p = p;
   t->buf = buf;
+  t->t0 = dclock();
   *(_receive_tag**)request = t;
 
   // dirty hack: test for identical receives
@@ -463,6 +465,7 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
     return 0;
 
   //_printf("WAIT %p\n",request);
+  double t0 = dclock();
 
   while (true) {
 
@@ -470,11 +473,23 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
       _shm_block* b = GET_BLOCK(i);
       if (b->status == STATUS_START && b->p.match(t->p)) {
 
+	double t1 = dclock();
+
 	complete_receive(b,t->buf);
 	b->status = STATUS_IDLE;
 
 	recv_tags.erase(t);
 	delete t;
+
+	double t2 = dclock();
+
+	double DT = t2 - t->t0;
+	double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
+
+	_printf("RECV %g GB/s total %g GB, %g s (%g%% in fast_copy, %g%% in busy blocks)\n",
+		size_in_gb / DT, size_in_gb, DT,
+		(t2-t1) / DT,
+		(t1-t0) / DT);
 
 	//_printf("Receive complete\n");
 	return 0;
