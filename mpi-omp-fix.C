@@ -344,7 +344,10 @@ int MPI_Barrier( MPI_Comm comm ) {
   if (!mpi_init)
     return -1;
 
-  _printf("Not implemented\n");
+  if (comm == mpi_world)
+    real_MPI_Barrier(mpi_myrank);
+  else
+    _printf("Not implemented\n");
   return 0;
 }
 //--------------------------------------------------------------------------------
@@ -514,6 +517,8 @@ int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
   if (!mpi_init)
     return -1;
 
+  double t0 = dclock();
+
   MPI_Request rs, rr;
   MPI_Isend(sendbuf,sendcount,sendtype,dest,sendtag,comm,&rs);
   MPI_Irecv(recvbuf,recvcount,recvtype,source,recvtag,comm,&rr);
@@ -522,6 +527,10 @@ int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
   MPI_Wait(&rs,&ss);
   MPI_Wait(&rr,status);
 
+  double t1 = dclock();
+  double size_in_gb = (double)(sendcount*type_size(sendtype) + recvcount*type_size(recvtype)) / 1024. / 1024. / 1024.;
+
+  _printf("Sendrecv: %g GB at %g GB/s\n",size_in_gb,size_in_gb / (t1-t0));
   return 0;
 }
 //--------------------------------------------------------------------------------
