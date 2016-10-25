@@ -5,6 +5,16 @@
 //  Year:    2016
 //  Summary: Distributes MPI communication over parallel mpi ranks
 //--------------------------------------------------------------------------------
+// Remark on openMP / openMPI behavior:
+//
+// This gets full performance if run without any binding but -npernode=X
+// Unfortunately, as soon as an opemMP parallel region is used affinity is
+// modified which limits MPI performance.  Solution: avoid any openMP parallel
+// region for worker ranks while main rank should be fine to use it!
+//
+// Numerical demonstration of this issue: 
+//   knlsubmit01:/root/clehner/shm-nofix-test3-rankfile
+//--------------------------------------------------------------------------------
 #include <mpi.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -61,7 +71,6 @@ static int mpi_node;
 static int mpi_nodes;
 static int mpi_id_on_node;
 static int verbosity;
-static int nthreads;
 static int rank_per_node;
 static int mpi_node_boss_id;
 static bool mpi_init;
@@ -213,9 +222,15 @@ static void process_send(int wid) {
 
   int target = WORKER_ADDR(b->p.node,wid+1);
 
-  MPI_Send((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,target,b->p.tag,mpi_world);
+  double t0 = dclock();
+  char* blank = (char*)b + HEADER_SIZE;
+  MPI_Send(blank,b->p.size,MPI_CHAR,target,b->p.tag,mpi_world);
+  double t1 = dclock();
 
-  //_printf("Sent data\n");
+  
+  double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
+  _printf("Sent %g GB at %g GB/s from %d -> %d\n",
+	  size_in_gb,size_in_gb/(t1-t0),mpi_id,target);
 
   b->status = STATUS_IDLE;
 
@@ -246,7 +261,14 @@ static void process_recv(int wid, int bytes, int source, int tag) {
   b->p.tag = tag;
 
   MPI_Status s;
+
+  double t0 = dclock();
   MPI_Recv((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,source,b->p.tag,mpi_world,&s);
+  double t1 = dclock();
+
+  double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
+  _printf("Received %g GB at %g GB/s from %d -> %d\n",
+	  size_in_gb,size_in_gb/(t1-t0),source,mpi_id);
 
   //_printf("Received data in block %d\n",wid);
 
@@ -517,8 +539,16 @@ int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
   if (!mpi_init)
     return -1;
 
-  double t0 = dclock();
 
+  // this is just for debugging purposes:
+  //real_MPI_Barrier(mpi_myrank);
+  //sleep(5);
+  //if (!mpi_node)
+  //  printf("--------------------------------------------------------------------------------\n");
+  //real_MPI_Barrier(mpi_myrank);
+  //
+
+  double t0 = dclock();
   MPI_Request rs, rr;
   MPI_Isend(sendbuf,sendcount,sendtype,dest,sendtag,comm,&rs);
   MPI_Irecv(recvbuf,recvcount,recvtype,source,recvtag,comm,&rr);
@@ -594,7 +624,7 @@ static void shm_exit() {
 //--------------------------------------------------------------------------------
 // Debug function to print the thread mapping
 //--------------------------------------------------------------------------------
-void debug_thread_mapping() {
+void debug_thread_mapping(bool allthreads) {
   std::vector<int> core;
   {
     FILE* f = fopen("/proc/cpuinfo","rt");
@@ -608,10 +638,18 @@ void debug_thread_mapping() {
     fclose(f);
   }
   
+  if (allthreads) {
+    if (mpi_id_on_node == 0) {
+      // only do this on master node to avoid omp affinity issue
 #pragma omp parallel
-  {
+      {
+	int cpu = sched_getcpu();
+	_printf("MPI-FIX:  Rank %d, Thread %d -> Core %d\n",mpi_id,omp_get_thread_num(),core[cpu]);
+      }
+    }
+  } else {
     int cpu = sched_getcpu();
-    _printf("MPI-FIX:  Rank %d, Thread %d -> Core %d\n",mpi_id,omp_get_thread_num(),core[cpu]);
+    _printf("MPI-FIX:  Rank %d -> Core %d\n",mpi_id,core[cpu]);
   }
 }
 //--------------------------------------------------------------------------------
@@ -622,20 +660,11 @@ static int (* real_main)(int argc, char* argv[], char* env[]);
 static int _main(int argc, char* argv[], char* env[]) {
 
   // init and query mpi
-  real_MPI_Init_thread(&argc,&argv,MPI_THREAD_MULTIPLE,&mpi_thread_provided);
+  //real_MPI_Init_thread(&argc,&argv,MPI_THREAD_MULTIPLE,&mpi_thread_provided);
+  real_MPI_Init(&argc,&argv);
+  mpi_thread_provided = MPI_THREAD_SINGLE;
   real_MPI_Comm_size(mpi_world,&mpi_n);
   real_MPI_Comm_rank(mpi_world,&mpi_id);
-
-  // query openmp
-#pragma omp parallel
-  {
-#pragma omp single
-    {
-      nthreads = omp_get_num_threads();
-    }
-  }
-
-  _printf("Running on %d threads\n",nthreads);
 
   // test environment
   {
@@ -676,10 +705,12 @@ static int _main(int argc, char* argv[], char* env[]) {
   if (verbosity > 0) {
     
     if (!mpi_node) {
-      _printf("MPI-FIX:  Init %d / %d, Thread-level: %d, OMP Threads %d\n",mpi_id,mpi_n,mpi_thread_provided,nthreads);
+      _printf("MPI-FIX:  Init %d / %d, Thread-level: %d\n",mpi_id,mpi_n,mpi_thread_provided);
+
+      debug_thread_mapping(false);
 
       if (verbosity > 1)
-	debug_thread_mapping();
+	debug_thread_mapping(true);
     }
   }
 
