@@ -443,16 +443,31 @@ static void copy_to_send_buffers() {
 //--------------------------------------------------------------------------------
 static void copy_from_receive_buffers() {
 
-  double size_in_gb = 0.0;
+  // Non-trivial: receive buffers may have become scrambled, need to match
 
+  double size_in_gb = 0.0;
   double t0 = dclock();
   std::set<_sendreceive_tag*>::iterator r;
   for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
     if ((*r)->submitted == false && !(*r)->send) {
 
-      _shm_block* b = GET_RECV_BLOCK((*r)->worker);
-      fast_copy((char*)(*r)->buf,(char*)b + HEADER_SIZE,b->p.size);
-      size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
+      // need to go through workers and match this receive and copy
+      // THAT memory instead of the (*r)->worker one.
+
+      int j;
+      for (j=0;j<WORKERS;j++) {
+	_shm_block* b = GET_RECV_BLOCK(j);
+	if (b->request && b->p.match((*r)->p)) {
+	  fast_copy((char*)(*r)->buf,(char*)b + HEADER_SIZE,b->p.size);
+	  size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
+	  break;
+	}
+      }
+
+      if (j == WORKERS) {
+	fprintf(stderr,"Could not match memory block!\n");
+	exit(8);
+      }
 
     }
   }
