@@ -168,57 +168,22 @@ inline double dclock() {
 //--------------------------------------------------------------------------------
 // Fast copy
 //--------------------------------------------------------------------------------
-#define BLOCK_UNROLL 1
-#define BLOCK_SIZE (sizeof(float)*16)
-//--------------------------------------------------------------------------------
-void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
-
-  const float* _src = (float*)src;
-  float* _dst = (float*)dst;
-  
-  int nthreads = omp_get_num_threads();
-  int ithread  = omp_get_thread_num();
-  for (int i=ithread;i<nblocks;i+=nthreads) {
-
-    const float* _src_ = &_src[i*16];
-    float* _dst_ = &_dst[i*16];
-
-    __m512 buffer1 = _mm512_load_ps(_src_);
-    _mm512_stream_ps(_dst_, buffer1);
-
-  }
-
-}
+#define COPY_DATA_TYPE double
+#define COPY_BLOCK_SIZE (sizeof(COPY_DATA_TYPE))
 //--------------------------------------------------------------------------------
 void fast_copy(char* dst, const char* src, size_t size) {
 
-  if (size % 8) {
-    fprintf(stderr,"Fast copy only works with size being multiple of 4\n");
+  if (size % COPY_BLOCK_SIZE) {
+    fprintf(stderr,"Fast copy only works with size being multiple of %d\n",COPY_BLOCK_SIZE);
     exit(5);
   }
 
-  const double* _src = (double*)src;
-  double* _dst = (double*)dst;
-  size /= 8;
+  const COPY_DATA_TYPE* _src = (COPY_DATA_TYPE*)src;
+  COPY_DATA_TYPE* _dst = (COPY_DATA_TYPE*)dst;
+  size /= COPY_BLOCK_SIZE;
 #pragma omp parallel for
   for (size_t i=0;i<size;i++)
     _dst[i] = _src[i];
-
-#if 0 // actually slower
-  size_t nfastblocks = (size - size % BLOCK_SIZE) / BLOCK_SIZE;
-  size_t size_slow = size - nfastblocks * BLOCK_SIZE;
-
-  // start copy threads
-#pragma omp parallel
-  {
-    fast_copy_blocks_threaded(dst,src,nfastblocks);
-  }
-
-  if (size_slow)
-    memcpy(dst + nfastblocks * BLOCK_SIZE,
-	   src + nfastblocks * BLOCK_SIZE, 
-	   size_slow);
-#endif
 }
 //--------------------------------------------------------------------------------
 // Block management
