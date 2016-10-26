@@ -127,16 +127,23 @@ struct _shm_block {
 #define STATUS_START 0x1
 #define STATUS_QUIT  0x2
   _packet_type p;
+  MPI_Request request;
 };
 //--------------------------------------------------------------------------------
-// Keeping track of Irecvs
+#define GET_BLOCK(i) ( (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * (i)) )
+#define GET_RECV_BLOCK(i)  GET_BLOCK(2*i + 0)
+#define GET_SEND_BLOCK(i)  GET_BLOCK(2*i + 1)
 //--------------------------------------------------------------------------------
-struct _receive_tag {
+// Keeping track of Irecvs and Isends
+//--------------------------------------------------------------------------------
+struct _sendreceive_tag {
+  bool send;
   _packet_type p;
   void* buf;
-  double t0; // timestamp of submission
+  bool submitted;
+  int worker;
 };
-std::set<_receive_tag*> recv_tags;
+std::set<_sendreceive_tag*> sendrecv_tags;
 //--------------------------------------------------------------------------------
 // Dirty hack to avoid out-of-order packets:  Make sure that only a single
 // mpi_isend and mpi_irecv is in place with matching _packet_type; stall operation
@@ -162,7 +169,6 @@ inline double dclock() {
 // Fast copy
 //--------------------------------------------------------------------------------
 #define BLOCK_SIZE (sizeof(float)*16)
-#define GET_BLOCK(i) ( (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * (i)) )
 //--------------------------------------------------------------------------------
 void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
 
@@ -218,21 +224,11 @@ static int type_size(MPI_Datatype t) {
 // Process send
 //--------------------------------------------------------------------------------
 static void process_send(int wid) {
-  _shm_block* b = GET_BLOCK(wid);
+  _shm_block* b = GET_SEND_BLOCK(wid);
 
-  int target = WORKER_ADDR(b->p.node,wid+1);
+  int target = WORKER_ADDR(b->p.node,wid);
 
-  double t0 = dclock();
-  char* blank = (char*)b + HEADER_SIZE;
-  MPI_Send(blank,b->p.size,MPI_CHAR,target,b->p.tag,mpi_world);
-  double t1 = dclock();
-
-  
-  double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
-  _printf("Sent %g GB at %g GB/s from %d -> %d\n",
-	  size_in_gb,size_in_gb/(t1-t0),mpi_id,target);
-
-  b->status = STATUS_IDLE;
+  real_MPI_Isend((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,target,b->p.tag,mpi_world,&b->request);
 
 }
 //--------------------------------------------------------------------------------
@@ -255,109 +251,97 @@ static void complete_receive(_shm_block* b, void* buf) {
 //--------------------------------------------------------------------------------
 static void process_recv(int wid, int bytes, int source, int tag) {
 
-  _shm_block* b = GET_BLOCK(wid);
+  _shm_block* b = GET_RECV_BLOCK(wid);
   b->p.size = bytes;
   b->p.node = ADDR_NODE(source);
   b->p.tag = tag;
 
-  MPI_Status s;
-
-  double t0 = dclock();
-  MPI_Recv((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,source,b->p.tag,mpi_world,&s);
-  double t1 = dclock();
-
-  double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
-  _printf("Received %g GB at %g GB/s from %d -> %d\n",
-	  size_in_gb,size_in_gb/(t1-t0),source,mpi_id);
-
-  //_printf("Received data in block %d\n",wid);
-
-  b->status = STATUS_START;
-
+  real_MPI_Irecv((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,source,b->p.tag,mpi_world,&b->request);
 }
 //--------------------------------------------------------------------------------
 // Worker job
 //--------------------------------------------------------------------------------
-static int next_worker_to_use = 0;
+static int next_send_worker = 0;
+static int next_recv_worker = 0;
 //--------------------------------------------------------------------------------
 static void worker() {
   int worker_id = mpi_id_on_node - 1;
-  bool bsend = (worker_id % 2) == 0;
 
-  //printf("Worker %d has addr %p (%p)\n",worker_id,GET_BLOCK(worker_id),blocks_ptr);
-
-  int last_status = -1;
+  volatile _shm_block* b_s = GET_SEND_BLOCK(worker_id);
+  volatile _shm_block* b_r = GET_RECV_BLOCK(worker_id);
 
   while (true) {
-    _shm_block* b = GET_BLOCK(worker_id);
 
-    //int status = b->status;
-    //if (b->status != last_status) {
-    //  _printf("Worker %d status changed to %d (%d)\n",worker_id,b->status,bsend);
-    //  last_status = b->status;
-    //}
+    if (b_s->status == STATUS_QUIT) {
 
-    if (b->status == STATUS_QUIT) {
+      b_s->status = STATUS_IDLE;
+      b_r->status = STATUS_IDLE;
 
-      b->status = STATUS_IDLE; // TEST
-      //_printf("Received quit signal\n");
       break;
 
-    } else if (!bsend && b->status == STATUS_IDLE) {
-
-      // can receive data from other nodes
-      MPI_Status s;
-
-      int flag;
-      MPI_Iprobe( MPI_ANY_SOURCE, MPI_ANY_TAG, mpi_world, &flag, &s );
-      
-      if (flag) {
-
-	int bytes;
-	MPI_Get_count(&s,MPI_CHAR,&bytes);
-
-	//_printf("Receive size = %d from %d\n",bytes,s.MPI_SOURCE);
-	
-	if (s.MPI_SOURCE == MASTER_ADDR(mpi_node)) {
-	  // special command from master, need to quit only option for now
-	  //_printf("Received quit signal from master\n");
-	  break;
-	}
-
-	process_recv(worker_id,bytes,s.MPI_SOURCE,s.MPI_TAG);
-      }
-
-    } else if (bsend && b->status == STATUS_START) {
-
-      //_printf("Start send\n");
-
-      // being told to send data in block cmd
-      process_send(worker_id);
     }
 
+    if (b_r->status == STATUS_START) {
+
+      if (!b_r->request) {
+
+	// can receive data from other nodes
+	MPI_Status s;
+	
+	int flag;
+	MPI_Iprobe( MPI_ANY_SOURCE, MPI_ANY_TAG, mpi_world, &flag, &s );
+	
+	if (flag) {
+
+	  int bytes;
+	  MPI_Get_count(&s,MPI_CHAR,&bytes);
+
+	  process_recv(worker_id,bytes,s.MPI_SOURCE,s.MPI_TAG);
+	  
+	}
+
+      } else {
+
+	int flag;
+	MPI_Status s;
+	MPI_Test((MPI_Request*)&b_r->request,&flag,&s);
+
+	if (flag) {
+	  b_r->status = STATUS_IDLE;
+	}
+      }
+
+    }
+
+    if (b_s->status == STATUS_START) {
+
+      if (!b_s->request) {
+
+	process_send(worker_id);
+
+      } else {
+
+	int flag;
+	MPI_Status s;
+	MPI_Test((MPI_Request*)&b_s->request,&flag,&s);
+
+	if (flag) {
+	  b_s->status = STATUS_IDLE;
+	}
+      }
+
+    }
   }
 }
 //--------------------------------------------------------------------------------
 static void kill_worker(int wid) {
-  _shm_block* b = GET_BLOCK(wid);
+  _shm_block* b = GET_SEND_BLOCK(wid);
   
-  bool bsend = (wid % 2) == 0;
-
-  if (bsend) {
-    while (b->status != STATUS_IDLE) {
-      
-      usleep(0);
-      
-    }
-
-    b->status = STATUS_QUIT;
-  } else {
-    int t = STATUS_QUIT;
-    //_printf("Try killing reader %d\n",wid);
-    MPI_Send(&t,1,MPI_INT,WORKER_ADDR(mpi_node,wid),0,mpi_world);
-    //_printf("Kill done\n");
+  while (b->status != STATUS_IDLE) {
+    usleep(0);
   }
 
+  b->status = STATUS_QUIT;
 }
 //--------------------------------------------------------------------------------
 // Barrier
@@ -373,10 +357,259 @@ int MPI_Barrier( MPI_Comm comm ) {
   return 0;
 }
 //--------------------------------------------------------------------------------
+static void initiate_sends_and_receives() {
+
+  int cs = 0;
+  int cr = 0;
+
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+
+    _sendreceive_tag* t = *r;
+    if (!t->submitted) {
+
+      _shm_block* b;
+      if (t->send) {
+	b = GET_SEND_BLOCK(t->worker);
+	cs++;
+      } else {
+	b = GET_RECV_BLOCK(t->worker);
+	cr++;
+      }
+
+      b->request = 0;
+      b->status = STATUS_START;
+    }
+
+  }
+
+  _printf("STATUS: %d sends, %d receives initiated\n",cs,cr);
+}
+//--------------------------------------------------------------------------------
+static void wait_for_sends_and_receives() {
+
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+
+    _sendreceive_tag* t = *r;
+    if (!t->submitted) {
+      _shm_block* b;
+
+      if (t->send) {
+	b = GET_SEND_BLOCK(t->worker);
+      } else {
+	b = GET_RECV_BLOCK(t->worker);
+      }
+
+      while (b->status != STATUS_IDLE)
+	usleep(0);
+
+    }
+
+  }
+
+}
+//--------------------------------------------------------------------------------
+static void copy_to_send_buffers() {
+
+  //real_MPI_Barrier(mpi_myrank);
+
+  double size_in_gb = 0.0;
+
+  double t0 = dclock();
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+    if ((*r)->submitted == false && (*r)->send) {
+
+      _shm_block* b = GET_SEND_BLOCK((*r)->worker);
+      fast_copy((char*)b + HEADER_SIZE,(const char*)(*r)->buf,b->p.size);
+      size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
+
+    }
+  }
+
+  double t1 = dclock();
+  _printf("Copy to send buffers %g GB at %g GB/s (%g GB/s memory bandwidth)\n",
+	  size_in_gb,size_in_gb/(t1-t0),2.0*size_in_gb/(t1-t0));
+
+  //real_MPI_Barrier(mpi_myrank);
+
+}
+//--------------------------------------------------------------------------------
+static void copy_from_receive_buffers() {
+
+  double size_in_gb = 0.0;
+
+  double t0 = dclock();
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+    if ((*r)->submitted == false && !(*r)->send) {
+
+      _shm_block* b = GET_RECV_BLOCK((*r)->worker);
+      fast_copy((char*)(*r)->buf,(char*)b + HEADER_SIZE,b->p.size);
+      size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
+
+    }
+  }
+
+  double t1 = dclock();
+  _printf("Copy from receive buffers %g GB at %g GB/s (%g memory bandwidth)\n",
+	  size_in_gb,size_in_gb/(t1-t0),2.0*size_in_gb/(t1-t0));
+
+}
+//--------------------------------------------------------------------------------
+static void commit_mpi() {
+
+  double size_in_gb = 0.0;
+
+  {
+    bool todo = false;
+    std::set<_sendreceive_tag*>::iterator r;
+    for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+      if ((*r)->submitted == false) {
+	todo = true;
+	size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
+      }
+    }
+
+    if (!todo)
+      return;
+  }
+
+  double t0 = dclock();
+
+  copy_to_send_buffers();
+
+  double t1 = dclock();
+
+  initiate_sends_and_receives();
+  
+  wait_for_sends_and_receives();
+
+  double t2 = dclock();
+
+  copy_from_receive_buffers();
+
+  double t3 = dclock();
+
+  _printf("TIMING: %g%% in MPI routines (%d sends, %d receives, %g GB at %g GB/s pure MPI would be %g GB/s)\n",
+	  100.0*(t2-t1)/(t3-t0),next_send_worker,next_recv_worker,
+	  size_in_gb,size_in_gb / (t3 - t0),
+	  size_in_gb / (t2-t1));
+
+  {
+    std::set<_sendreceive_tag*>::iterator r;
+    for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+      (*r)->submitted = true;
+    }
+  }
+
+  next_send_worker = 0;
+  next_recv_worker = 0;
+}
+//--------------------------------------------------------------------------------
 // MPI_Isend
 //--------------------------------------------------------------------------------
 int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
 	      MPI_Comm comm, MPI_Request *request) {
+
+  if (next_send_worker >= WORKERS)
+    commit_mpi();
+
+  if (comm != mpi_world) {
+    fprintf(stderr,"Non-world communicators not yet implemented!\n");
+    exit(4);
+  }
+
+  if (sizeof(MPI_Request) < sizeof(_sendreceive_tag*)) {
+    fprintf(stderr,"MPI_Request has too small size = %d\n",sizeof(MPI_Request));
+    exit(1);
+  }
+
+  _packet_type p;
+  p.tag = tag;
+  p.node = dest;
+  p.size = count*type_size(datatype);
+
+  if (p.size > block_size) {
+    fprintf(stderr,"Block limit currently is %d bytes (tried %d)\n",block_size,p.size);
+    exit(7);
+  }
+
+  _sendreceive_tag* t = new _sendreceive_tag();
+  t->send = true;
+  t->p = p;
+  t->buf = (void*)buf;
+  t->submitted = false;
+  t->worker = next_send_worker++;
+
+  GET_SEND_BLOCK(t->worker)->p = p;
+
+  *(_sendreceive_tag**)request = t;
+
+  // dirty hack: test for identical sends
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+    if ((*r)->send && (*r)->p.match(p)) {
+      fprintf(stderr,"For now overlapping identical sends not allowed!\n");
+      exit(12);
+    }
+  }
+
+  sendrecv_tags.insert(t);
+
+}
+//--------------------------------------------------------------------------------
+// MPI_Irecv
+//--------------------------------------------------------------------------------
+int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
+	      int tag, MPI_Comm comm, MPI_Request *request) {
+
+  if (next_recv_worker >= WORKERS)
+    commit_mpi();
+
+  if (comm != mpi_world) {
+    fprintf(stderr,"Non-world communicators not yet implemented!\n");
+    exit(4);
+  }
+
+  if (sizeof(MPI_Request) < sizeof(_sendreceive_tag*)) {
+    fprintf(stderr,"MPI_Request has too small size = %d\n",sizeof(MPI_Request));
+    exit(1);
+  }
+
+  _packet_type p;
+  p.tag = tag;
+  p.node = source;
+  p.size = count*type_size(datatype);
+
+  _sendreceive_tag* t = new _sendreceive_tag();
+  t->send = false;
+  t->p = p;
+  t->buf = buf;
+  t->submitted = false;
+  t->worker = next_recv_worker++;
+
+  GET_RECV_BLOCK(t->worker)->p = p;
+
+  *(_sendreceive_tag**)request = t;
+
+  // dirty hack: test for identical receives
+  std::set<_sendreceive_tag*>::iterator r;
+  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
+    if (!(*r)->send && (*r)->p.match(p)) {
+      fprintf(stderr,"For now overlapping identical receives not allowed!\n");
+      exit(12);
+    }
+  }
+
+  sendrecv_tags.insert(t);
+
+  return 0;
+}
+/*
+void perform_sends() {
+
 
    
   double _t0 = dclock();
@@ -391,10 +624,6 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int t
   p.node = dest;
   p.size = count*type_size(datatype);
 
-  if (p.size > block_size) {
-    fprintf(stderr,"Block limit currently is %d bytes (tried %d)\n",block_size,p.size);
-    exit(7);
-  }
 
   // hack: make sure that no matching send is already in progress
   double t_before_busy = dclock();
@@ -436,58 +665,14 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int t
 	  size_in_gb / (_t10-_t0), size_in_gb, _t10-_t0,
 	  (t1-t0) / (_t10-_t0),
 	  (t_after_busy - t_before_busy) / (_t10-_t0));
+
 }
-//--------------------------------------------------------------------------------
-// MPI_Irecv
-//--------------------------------------------------------------------------------
-int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
-	      int tag, MPI_Comm comm, MPI_Request *request) {
-
-  if (comm != mpi_world) {
-    fprintf(stderr,"Non-world communicators not yet implemented!\n");
-    exit(4);
-  }
-
-  if (sizeof(MPI_Request) < sizeof(_receive_tag*)) {
-    fprintf(stderr,"MPI_Request has too small size = %d\n",sizeof(MPI_Request));
-    exit(1);
-  }
-
-  _packet_type p;
-  p.tag = tag;
-  p.node = source;
-  p.size = count*type_size(datatype);
-
-  _receive_tag* t = new _receive_tag();
-  t->p = p;
-  t->buf = buf;
-  t->t0 = dclock();
-  *(_receive_tag**)request = t;
-
-  // dirty hack: test for identical receives
-  std::set<_receive_tag*>::iterator r;
-  for (r=recv_tags.begin();r!=recv_tags.end();r++) {
-    if ((*r)->p.match(p)) {
-      fprintf(stderr,"For now overlapping identical receives not allowed!\n");
-      exit(12);
-    }
-  }
-
-  recv_tags.insert(t);
-
-  //_printf("Irecv\n");
-
-  return 0;
-}
-//--------------------------------------------------------------------------------
-// MPI_Wait
-//--------------------------------------------------------------------------------
-int MPI_Wait(MPI_Request *request, MPI_Status *status) {
-
   _receive_tag* t = *(_receive_tag**)request;
 
   if (!t) // no need to wait (send)
     return 0;
+
+  _printf("--------------------------------------------------------------------------------\n");
 
   //_printf("WAIT %p\n",request);
   double t0 = dclock();
@@ -511,7 +696,7 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 	double DT = t2 - t->t0;
 	double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
 
-	_printf("RECV %g GB/s total %g GB, %g s (%g%% in fast_copy, %g%% in busy blocks)\n",
+	_printf("RECV %g GB/s total %g GB, %g s (%g in fast_copy, %g in busy blocks)\n",
 		size_in_gb / DT, size_in_gb, DT,
 		(t2-t1) / DT,
 		(t1-t0) / DT);
@@ -523,8 +708,18 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 
     usleep(0);
   }
+}*/
+//--------------------------------------------------------------------------------
+// MPI_Wait
+//--------------------------------------------------------------------------------
+int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 
-  // never reached
+  commit_mpi();
+
+  _sendreceive_tag* t = *(_sendreceive_tag**)request;
+  sendrecv_tags.erase(t);
+
+  // TODO: fill status of corresponding request
   return 0;
 }
 //--------------------------------------------------------------------------------
@@ -641,6 +836,7 @@ void debug_thread_mapping(bool allthreads) {
   if (allthreads) {
     if (mpi_id_on_node == 0) {
       // only do this on master node to avoid omp affinity issue
+      return;
 #pragma omp parallel
       {
 	int cpu = sched_getcpu();
@@ -715,14 +911,8 @@ static int _main(int argc, char* argv[], char* env[]) {
   }
 
   // shm parameters
-  block_count = WORKERS;
+  block_count = WORKERS*2;
   block_size = 16*1024*PAGE_SIZE;
-
-  // need an even number of workers (one for send, one for receive)
-  if (WORKERS % 2) {
-    fprintf(stderr,"Need even number of workers (workers = %d)\n",WORKERS);
-    exit(4);
-  }
 
   // create shared memory
   shm_init();
