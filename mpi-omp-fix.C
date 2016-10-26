@@ -232,21 +232,6 @@ static void process_send(int wid) {
 
 }
 //--------------------------------------------------------------------------------
-static void complete_receive(_shm_block* b, void* buf) {
-
-  double t0 = dclock();
-  fast_copy((char*)buf,(char*)b + HEADER_SIZE,b->p.size);
-  double t1 = dclock();
-  
-  //if (verbosity > 1) {
-  {
-    //double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
-    //_printf("Fast-copy (RECV) %g GB/s total %g GB\n",
-    //   size_in_gb / (t1-t0), size_in_gb);
-  }
-  
-}
-//--------------------------------------------------------------------------------
 // Process receive
 //--------------------------------------------------------------------------------
 static void process_recv(int wid, int bytes, int source, int tag) {
@@ -607,108 +592,6 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
 
   return 0;
 }
-/*
-void perform_sends() {
-
-
-   
-  double _t0 = dclock();
-
-  if (comm != mpi_world) {
-    fprintf(stderr,"Non-world communicators not yet implemented!\n");
-    exit(4);
-  }
-
-  _packet_type p;
-  p.tag = tag;
-  p.node = dest;
-  p.size = count*type_size(datatype);
-
-
-  // hack: make sure that no matching send is already in progress
-  double t_before_busy = dclock();
-  {
-    for (int i=0;i<WORKERS;i+=2) {
-      _shm_block* b = GET_BLOCK(i);
-      while (b->status == STATUS_START && b->p.match(p)) {
-	//fprintf(stderr,"For now: do not accept overlapping identical sends\n");
-	//exit(5);
-	usleep(0);
-      }
-    }
-  }
-
-  // wait for next worker to be available
-  _shm_block* b = GET_BLOCK(next_worker_to_use);
-  //_printf("Get block %d\n",next_worker_to_use);
-  *(_receive_tag**)request = 0;
-
-  next_worker_to_use = (next_worker_to_use + 2) % WORKERS;
-  while (b->status != STATUS_IDLE)
-    usleep(0);
-  double t_after_busy = dclock();
-
-  // OK, go!
-  b->p = p;
-  double t0 = dclock();
-  fast_copy((char*)b + HEADER_SIZE,(const char*)buf,b->p.size);
-  double t1 = dclock();
-    
-  //if (verbosity > 1) {
-  double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
-  
-  //_printf("Set status send %d\n",(int)((long long)b - (long long)blocks_ptr));
-  b->status = STATUS_START;
-
-  double _t10 = dclock();
-  _printf("SEND %g GB/s total %g GB, %g s (%g%% in fast_copy, %g%% in busy blocks)\n",
-	  size_in_gb / (_t10-_t0), size_in_gb, _t10-_t0,
-	  (t1-t0) / (_t10-_t0),
-	  (t_after_busy - t_before_busy) / (_t10-_t0));
-
-}
-  _receive_tag* t = *(_receive_tag**)request;
-
-  if (!t) // no need to wait (send)
-    return 0;
-
-  _printf("--------------------------------------------------------------------------------\n");
-
-  //_printf("WAIT %p\n",request);
-  double t0 = dclock();
-
-  while (true) {
-
-    for (int i=1;i<WORKERS;i+=2) {
-      _shm_block* b = GET_BLOCK(i);
-      if (b->status == STATUS_START && b->p.match(t->p)) {
-
-	double t1 = dclock();
-
-	complete_receive(b,t->buf);
-	b->status = STATUS_IDLE;
-
-	recv_tags.erase(t);
-	delete t;
-
-	double t2 = dclock();
-
-	double DT = t2 - t->t0;
-	double size_in_gb = (double)b->p.size / 1024. / 1024. / 1024.;
-
-	_printf("RECV %g GB/s total %g GB, %g s (%g in fast_copy, %g in busy blocks)\n",
-		size_in_gb / DT, size_in_gb, DT,
-		(t2-t1) / DT,
-		(t1-t0) / DT);
-
-	//_printf("Receive complete\n");
-	return 0;
-      }
-    }
-
-    usleep(0);
-  }
-}*/
 //--------------------------------------------------------------------------------
 // MPI_Wait
 //--------------------------------------------------------------------------------
