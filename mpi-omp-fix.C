@@ -168,6 +168,7 @@ inline double dclock() {
 //--------------------------------------------------------------------------------
 // Fast copy
 //--------------------------------------------------------------------------------
+#define BLOCK_UNROLL 1
 #define BLOCK_SIZE (sizeof(float)*16)
 //--------------------------------------------------------------------------------
 void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
@@ -178,14 +179,32 @@ void fast_copy_blocks_threaded(void* dst, const void* src, int nblocks) {
   int nthreads = omp_get_num_threads();
   int ithread  = omp_get_thread_num();
   for (int i=ithread;i<nblocks;i+=nthreads) {
-    __m512 buffer = _mm512_load_ps(_src + i*16);
-    _mm512_stream_ps(_dst + i*16 , buffer);
+
+    const float* _src_ = &_src[i*16];
+    float* _dst_ = &_dst[i*16];
+
+    __m512 buffer1 = _mm512_load_ps(_src_);
+    _mm512_stream_ps(_dst_, buffer1);
+
   }
 
 }
 //--------------------------------------------------------------------------------
 void fast_copy(char* dst, const char* src, size_t size) {
 
+  if (size % 8) {
+    fprintf(stderr,"Fast copy only works with size being multiple of 4\n");
+    exit(5);
+  }
+
+  const double* _src = (double*)src;
+  double* _dst = (double*)dst;
+  size /= 8;
+#pragma omp parallel for
+  for (size_t i=0;i<size;i++)
+    _dst[i] = _src[i];
+
+#if 0 // actually slower
   size_t nfastblocks = (size - size % BLOCK_SIZE) / BLOCK_SIZE;
   size_t size_slow = size - nfastblocks * BLOCK_SIZE;
 
@@ -199,6 +218,7 @@ void fast_copy(char* dst, const char* src, size_t size) {
     memcpy(dst + nfastblocks * BLOCK_SIZE,
 	   src + nfastblocks * BLOCK_SIZE, 
 	   size_slow);
+#endif
 }
 //--------------------------------------------------------------------------------
 // Block management
@@ -438,7 +458,7 @@ static void copy_from_receive_buffers() {
   }
 
   double t1 = dclock();
-  _printf("Copy from receive buffers %g GB at %g GB/s (%g memory bandwidth)\n",
+  _printf("Copy from receive buffers %g GB at %g GB/s (%g GB/s memory bandwidth)\n",
 	  size_in_gb,size_in_gb/(t1-t0),2.0*size_in_gb/(t1-t0));
 
 }
