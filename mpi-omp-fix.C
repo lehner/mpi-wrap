@@ -121,13 +121,52 @@ struct _packet_type {
   }
 };
 //--------------------------------------------------------------------------------
-struct _shm_block {
+class _shm_block {
+private:
   int status;
 #define STATUS_IDLE  0x0
 #define STATUS_START 0x1
 #define STATUS_QUIT  0x2
+#define STATUS_COMPLETE 0x4
+
+public:
   _packet_type p;
   MPI_Request request;
+  size_t progress;
+  size_t last_send_amount;
+
+  bool isIdle() volatile {
+    return status == STATUS_IDLE;
+  }
+
+  bool shouldQuit() volatile {
+    return status == STATUS_QUIT;
+  }
+
+  bool shouldStart() volatile {
+    return status == STATUS_START;
+  }
+
+  void setComplete() volatile {
+    status = STATUS_COMPLETE;
+  }
+
+  bool isComplete() volatile {
+    return status == STATUS_COMPLETE;
+  }
+
+  void setIdle() volatile {
+    status = STATUS_IDLE;
+  }
+
+  void setStart() volatile {
+    status = STATUS_START;
+  }
+
+  void setQuit() volatile {
+    status = STATUS_QUIT;
+  }
+  
 };
 //--------------------------------------------------------------------------------
 #define GET_BLOCK(i) ( (_shm_block*)(blocks_ptr + (block_size + HEADER_SIZE) * (i)) )
@@ -206,29 +245,6 @@ static int type_size(MPI_Datatype t) {
   }
 }
 //--------------------------------------------------------------------------------
-// Process send
-//--------------------------------------------------------------------------------
-static void process_send(int wid) {
-  _shm_block* b = GET_SEND_BLOCK(wid);
-
-  int target = WORKER_ADDR(b->p.node,wid);
-
-  real_MPI_Isend((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,target,b->p.tag,mpi_world,&b->request);
-
-}
-//--------------------------------------------------------------------------------
-// Process receive
-//--------------------------------------------------------------------------------
-static void process_recv(int wid, int bytes, int source, int tag) {
-
-  _shm_block* b = GET_RECV_BLOCK(wid);
-  b->p.size = bytes;
-  b->p.node = ADDR_NODE(source);
-  b->p.tag = tag;
-
-  real_MPI_Irecv((char*)b + HEADER_SIZE,b->p.size,MPI_CHAR,source,b->p.tag,mpi_world,&b->request);
-}
-//--------------------------------------------------------------------------------
 // Worker job
 //--------------------------------------------------------------------------------
 static int next_send_worker = 0;
@@ -242,17 +258,12 @@ static void worker() {
 
   while (true) {
 
-    if (b_s->status == STATUS_QUIT) {
-
-      b_s->status = STATUS_IDLE;
-      b_r->status = STATUS_IDLE;
-
+    if (b_s->shouldQuit())
       break;
 
-    }
+    if (b_r->shouldStart()) {
 
-    if (b_r->status == STATUS_START) {
-
+      // if request is not set, we are waiting for the chance to do an Irecv
       if (!b_r->request) {
 
 	// can receive data from other nodes
@@ -266,28 +277,87 @@ static void worker() {
 	  int bytes;
 	  MPI_Get_count(&s,MPI_CHAR,&bytes);
 
-	  process_recv(worker_id,bytes,s.MPI_SOURCE,s.MPI_TAG);
+	  // first sizeof(size_t) bytes tell us total size
+	  if (!b_r->p.size) {
+
+	    void* target = (char*)b_r + HEADER_SIZE - sizeof(size_t);
+	    real_MPI_Irecv(target,
+			   bytes,MPI_CHAR,s.MPI_SOURCE,
+			   b_r->p.tag,mpi_world,(MPI_Request*)&b_r->request);
+
+	    b_r->p.node = ADDR_NODE(s.MPI_SOURCE);
+	    b_r->p.tag = s.MPI_TAG;
+	    b_r->progress = bytes - sizeof(size_t);
+
+	  } else {
+
+	    void* target = (char*)b_r + HEADER_SIZE + b_r->progress;
+	    real_MPI_Irecv(target,
+			   bytes,MPI_CHAR,s.MPI_SOURCE,
+			   b_r->p.tag,mpi_world,(MPI_Request*)&b_r->request);
+
+	    b_r->progress += bytes;
+
+	  }
 	  
 	}
 
       } else {
 
+	// test if data has completely arrived
 	int flag;
 	MPI_Status s;
 	MPI_Test((MPI_Request*)&b_r->request,&flag,&s);
 
 	if (flag) {
-	  b_r->status = STATUS_IDLE;
+	  b_r->request = 0;
+
+	  if (!b_r->p.size) {
+	    void* target = (char*)b_r + HEADER_SIZE - sizeof(size_t);
+	    b_r->p.size = *(size_t*)target;
+	  }
+
+	  // are we done receiving this buffer?
+	  if (b_r->progress == b_r->p.size) {
+	    b_r->setComplete();
+	  } else if (b_r->progress > b_r->p.size) {
+	    fprintf(stderr,"Logic error in receive (%d, %d)\n",(int)b_r->progress,(int)b_r->p.size);
+	    exit(5);
+	  }
 	}
       }
 
     }
 
-    if (b_s->status == STATUS_START) {
+    if (b_s->shouldStart()) {
 
       if (!b_s->request) {
 
-	process_send(worker_id);
+	int target_addr = WORKER_ADDR(b_s->p.node,worker_id);
+
+	if (!b_s->progress) {
+	  
+	  void* target = (char*)b_s + HEADER_SIZE - sizeof(size_t);
+	  *(size_t*)target = b_s->p.size;
+
+	  // TODO: here need to add functionality to only send fraction of data
+	  size_t data_size = b_s->p.size;
+	  real_MPI_Isend(target,data_size + sizeof(size_t),MPI_CHAR,target_addr,
+			 b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	  b_s->last_send_amount = data_size;
+
+	} else {
+
+	  _printf("Why am I here: %d %d\n",(int)b_s->progress,(int)b_s->p.size);
+	  // this is a follow-up send
+	    void* target = (char*)b_s + HEADER_SIZE + b_s->progress;
+	    size_t data_size = 0; // TODO: see above
+	    real_MPI_Isend(target,data_size,MPI_CHAR,target_addr,
+			   b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	    b_s->last_send_amount = data_size;
+
+	}
+
 
       } else {
 
@@ -296,7 +366,14 @@ static void worker() {
 	MPI_Test((MPI_Request*)&b_s->request,&flag,&s);
 
 	if (flag) {
-	  b_s->status = STATUS_IDLE;
+	  b_s->request = 0;
+	  b_s->progress += b_s->last_send_amount;
+	  if (b_s->progress == b_s->p.size) {
+	    b_s->setComplete();
+	  } else if (b_s->progress > b_s->p.size) {
+	    fprintf(stderr,"Logic error in send\n");
+	    exit(6);
+	  }
 	}
       }
 
@@ -307,11 +384,11 @@ static void worker() {
 static void kill_worker(int wid) {
   _shm_block* b = GET_SEND_BLOCK(wid);
   
-  while (b->status != STATUS_IDLE) {
+  while (!b->isIdle()) {
     usleep(0);
   }
-
-  b->status = STATUS_QUIT;
+  
+  b->setQuit();
 }
 //--------------------------------------------------------------------------------
 // Barrier
@@ -338,17 +415,20 @@ static void initiate_sends_and_receives() {
     _sendreceive_tag* t = *r;
     if (!t->submitted) {
 
-      _shm_block* b;
+      volatile _shm_block* b;
       if (t->send) {
 	b = GET_SEND_BLOCK(t->worker);
 	cs++;
       } else {
 	b = GET_RECV_BLOCK(t->worker);
+	b->p.size = 0;
 	cr++;
       }
 
       b->request = 0;
-      b->status = STATUS_START;
+      b->progress = 0;
+
+      b->setStart();
     }
 
   }
@@ -363,7 +443,7 @@ static void wait_for_sends_and_receives() {
 
     _sendreceive_tag* t = *r;
     if (!t->submitted) {
-      _shm_block* b;
+      volatile _shm_block* b;
 
       if (t->send) {
 	b = GET_SEND_BLOCK(t->worker);
@@ -371,9 +451,10 @@ static void wait_for_sends_and_receives() {
 	b = GET_RECV_BLOCK(t->worker);
       }
 
-      while (b->status != STATUS_IDLE)
+      while (!b->isComplete())
 	usleep(0);
 
+      b->setIdle();
     }
 
   }
@@ -422,7 +503,8 @@ static void copy_from_receive_buffers() {
       int j;
       for (j=0;j<WORKERS;j++) {
 	_shm_block* b = GET_RECV_BLOCK(j);
-	if (b->request && b->p.match((*r)->p)) {
+	if (b->progress && b->progress == (*r)->p.size && 
+	    b->p.match((*r)->p)) {
 	  fast_copy((char*)(*r)->buf,(char*)b + HEADER_SIZE,b->p.size);
 	  size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
 	  break;
