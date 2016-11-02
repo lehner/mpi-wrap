@@ -136,6 +136,7 @@ public:
   _packet_type p;
   MPI_Request request;
   size_t progress;
+  size_t buffer_progress;
   size_t last_send_amount;
 
   bool isIdle() volatile {
@@ -342,19 +343,29 @@ static void worker() {
 	  data_size = conf_SEND_BLOCK_SIZE;
 	b_s->last_send_amount = data_size;
 
-	if (!b_s->progress) {
+	// only send data if buffer is ready
+	if (b_s->progress + data_size <= b_s->buffer_progress) {
 	  
-	  void* target = (char*)b_s + HEADER_SIZE - sizeof(size_t);
-	  *(size_t*)target = b_s->p.size;
-	  real_MPI_Isend(target,data_size + sizeof(size_t),MPI_CHAR,target_addr,
-			 b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	  if (!b_s->progress) {
+	    
+	    void* target = (char*)b_s + HEADER_SIZE - sizeof(size_t);
+	    *(size_t*)target = b_s->p.size;
+	    real_MPI_Isend(target,data_size + sizeof(size_t),MPI_CHAR,target_addr,
+			   b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	    
+	  } else {
+	    
+	    // this is a follow-up send
+	    void* target = (char*)b_s + HEADER_SIZE + b_s->progress;
+	    real_MPI_Isend(target,data_size,MPI_CHAR,target_addr,
+			   b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	    
+	  }
 
 	} else {
 
-	  // this is a follow-up send
-	  void* target = (char*)b_s + HEADER_SIZE + b_s->progress;
-	  real_MPI_Isend(target,data_size,MPI_CHAR,target_addr,
-			 b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
+	  // otherwise sleep a little
+	  //usleep(1);
 
 	}
 
@@ -411,10 +422,10 @@ static void initiate_sends_and_receives() {
 
   std::set<_sendreceive_tag*>::iterator r;
   for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
-
+    
     _sendreceive_tag* t = *r;
     if (!t->submitted) {
-
+      
       volatile _shm_block* b;
       if (t->send) {
 	b = GET_SEND_BLOCK(t->worker);
@@ -424,13 +435,14 @@ static void initiate_sends_and_receives() {
 	b->p.size = 0;
 	cr++;
       }
-
+      
       b->request = 0;
       b->progress = 0;
-
+      b->buffer_progress = 0; //b->p.size;// TODO 0;
+      
       b->setStart();
     }
-
+    
   }
 
   _printf("STATUS: %d sends, %d receives initiated\n",cs,cr);
@@ -451,8 +463,35 @@ static void wait_for_sends_and_receives() {
 	b = GET_RECV_BLOCK(t->worker);
       }
 
-      while (!b->isComplete())
+      while (!b->isComplete()) {
+
+	if (t->send) {
+
+	  if (b->buffer_progress < b->p.size) {
+	    
+	    b->buffer_progress = b->p.size; // as soon as I set this here performance goes
+	    // down from 40 GB/s to 6 GB/s ... wow
+
+#if 0
+	    size_t left = b->p.size - b->buffer_progress;
+	    const char* src = (const char*)(*r)->buf + b->buffer_progress;
+	    char* dst = (char*)b + HEADER_SIZE + b->buffer_progress;
+	    size_t size = conf_SEND_BLOCK_SIZE;
+	    if (size > left)
+	      size = left;
+	    //fast_copy(dst,src,size);
+	    //memcpy(dst,src,size);
+	    
+	    b->buffer_progress += size;
+#endif
+	    
+	    //usleep(10);
+	  }
+
+	}
+
 	usleep(0);
+      }
 
       b->setIdle();
     }
@@ -462,29 +501,6 @@ static void wait_for_sends_and_receives() {
 }
 //--------------------------------------------------------------------------------
 static void copy_to_send_buffers() {
-
-  //real_MPI_Barrier(mpi_myrank);
-
-  double size_in_gb = 0.0;
-
-  double t0 = dclock();
-  std::set<_sendreceive_tag*>::iterator r;
-  for (r=sendrecv_tags.begin();r!=sendrecv_tags.end();r++) {
-    if ((*r)->submitted == false && (*r)->send) {
-
-      _shm_block* b = GET_SEND_BLOCK((*r)->worker);
-      fast_copy((char*)b + HEADER_SIZE,(const char*)(*r)->buf,b->p.size);
-      size_in_gb += (double)(*r)->p.size / 1024. / 1024. / 1024.;
-
-    }
-  }
-
-  double t1 = dclock();
-  _printf("Copy to send buffers %g GB at %g GB/s (%g GB/s memory bandwidth)\n",
-	  size_in_gb,size_in_gb/(t1-t0),2.0*size_in_gb/(t1-t0));
-
-  //real_MPI_Barrier(mpi_myrank);
-
 }
 //--------------------------------------------------------------------------------
 static void copy_from_receive_buffers() {
@@ -545,7 +561,7 @@ static void commit_mpi() {
 
   double t0 = dclock();
 
-  copy_to_send_buffers();
+  //copy_to_send_buffers();
 
   double t1 = dclock();
 
