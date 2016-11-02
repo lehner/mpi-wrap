@@ -75,6 +75,9 @@ static int rank_per_node;
 static int mpi_node_boss_id;
 static bool mpi_init;
 //--------------------------------------------------------------------------------
+static int conf_SEND_BLOCK_SIZE;
+static int conf_TOTAL_BLOCK_SIZE;
+//--------------------------------------------------------------------------------
 // Mapping of addresses
 //
 // Idea: 
@@ -191,7 +194,6 @@ std::set<_sendreceive_tag*> sendrecv_tags;
 //--------------------------------------------------------------------------------
 #define PAGE_SIZE 4096
 #define HEADER_SIZE PAGE_SIZE
-#define WORKER_COMM_SIZE PAGE_SIZE*2
 static char*  blocks_ptr;
 static size_t block_size;
 static size_t block_count;
@@ -335,26 +337,24 @@ static void worker() {
 
 	int target_addr = WORKER_ADDR(b_s->p.node,worker_id);
 
+	size_t data_size = b_s->p.size - b_s->progress;
+	if (data_size > conf_SEND_BLOCK_SIZE)
+	  data_size = conf_SEND_BLOCK_SIZE;
+	b_s->last_send_amount = data_size;
+
 	if (!b_s->progress) {
 	  
 	  void* target = (char*)b_s + HEADER_SIZE - sizeof(size_t);
 	  *(size_t*)target = b_s->p.size;
-
-	  // TODO: here need to add functionality to only send fraction of data
-	  size_t data_size = b_s->p.size;
 	  real_MPI_Isend(target,data_size + sizeof(size_t),MPI_CHAR,target_addr,
 			 b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
-	  b_s->last_send_amount = data_size;
 
 	} else {
 
-	  _printf("Why am I here: %d %d\n",(int)b_s->progress,(int)b_s->p.size);
 	  // this is a follow-up send
-	    void* target = (char*)b_s + HEADER_SIZE + b_s->progress;
-	    size_t data_size = 0; // TODO: see above
-	    real_MPI_Isend(target,data_size,MPI_CHAR,target_addr,
-			   b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
-	    b_s->last_send_amount = data_size;
+	  void* target = (char*)b_s + HEADER_SIZE + b_s->progress;
+	  real_MPI_Isend(target,data_size,MPI_CHAR,target_addr,
+			 b_s->p.tag,mpi_world,(MPI_Request*)&b_s->request);
 
 	}
 
@@ -845,6 +845,18 @@ static int _main(int argc, char* argv[], char* env[]) {
       verbosity = atoi(t);
     else
       verbosity = 0;
+
+    t = getenv("MPI_FIX_SEND_BLOCK_SIZE");
+    if (t)
+      conf_SEND_BLOCK_SIZE = atoi(t);
+    else
+      conf_SEND_BLOCK_SIZE = 1024*PAGE_SIZE;
+
+    t = getenv("MPI_FIX_TOTAL_BLOCK_SIZE");
+    if (t)
+      conf_TOTAL_BLOCK_SIZE = atoi(t);
+    else
+      conf_TOTAL_BLOCK_SIZE = 16*1024*PAGE_SIZE;
     
   }
 
@@ -877,7 +889,7 @@ static int _main(int argc, char* argv[], char* env[]) {
 
   // shm parameters
   block_count = WORKERS*2;
-  block_size = 16*1024*PAGE_SIZE;
+  block_size = conf_TOTAL_BLOCK_SIZE;
 
   // create shared memory
   shm_init();
