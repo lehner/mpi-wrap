@@ -52,6 +52,23 @@ int (* real_MPI_Wait)(MPI_Request *request, MPI_Status *status);
 int (* real_MPI_Comm_size)( MPI_Comm comm, int *size );
 int (* real_MPI_Comm_rank)(MPI_Comm comm, int *rank);
 int (* real_MPI_Finalize)( void );
+int (* real_MPI_Initialized)( int *flag );
+int (* real_MPI_Cart_create)(MPI_Comm comm_old, int ndims, const int dims[],
+			     const int periods[], int reorder, MPI_Comm *comm_cart);
+int (* real_MPI_Allreduce)(const void *sendbuf, void *recvbuf, int count,
+			   MPI_Datatype datatype, MPI_Op op, MPI_Comm comm);
+int (* real_MPI_Cart_shift)(MPI_Comm comm, int direction, int disp, int *rank_source,
+			    int *rank_dest);
+int (* real_MPI_Cart_rank)(MPI_Comm comm, const int coords[], int *rank);
+int (* real_MPI_Cart_coords)(MPI_Comm comm, int rank, int maxdims, int coords[]);
+int (* real_MPI_Send)(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
+		      MPI_Comm comm);
+int (* real_MPI_Recv)(void *buf, int count, MPI_Datatype datatype, int source, int tag,
+		      MPI_Comm comm, MPI_Status *status);
+int (* real_MPI_Waitall)(int count, MPI_Request array_of_requests[], 
+			 MPI_Status array_of_statuses[]);
+int (* real_MPI_Bcast)( void *buffer, int count, MPI_Datatype datatype, int root, 
+			MPI_Comm comm );
 int (* real___libc_start_main)(void *func_ptr,
 			       int argc,
 			       char* argv[],
@@ -935,6 +952,16 @@ extern "C" int __libc_start_main(int (* func_ptr)(int argc, char* argv[], char* 
   LOAD(MPI_Comm_size);
   LOAD(MPI_Comm_rank);
   LOAD(MPI_Finalize);
+  LOAD(MPI_Initialized);
+  LOAD(MPI_Cart_create);
+  LOAD(MPI_Cart_coords);
+  LOAD(MPI_Allreduce);
+  LOAD(MPI_Cart_shift);
+  LOAD(MPI_Cart_rank);
+  LOAD(MPI_Send);
+  LOAD(MPI_Recv);
+  LOAD(MPI_Waitall);
+  LOAD(MPI_Bcast);
   LOAD(__libc_start_main);
 
   // defaults
@@ -959,25 +986,41 @@ extern "C" int __libc_start_main(int (* func_ptr)(int argc, char* argv[], char* 
 //--------------------------------------------------------------------------------
 // Trivial functions
 //--------------------------------------------------------------------------------
+MPI_Comm mpi_world_replace(MPI_Comm c) {
+  if (c == mpi_world)
+    return mpi_myrank;
+  return c;
+}
+//--------------------------------------------------------------------------------
+static int mpi_init_status = 0;
+//--------------------------------------------------------------------------------
 int MPI_Init_thread( int *argc, char ***argv, int required, int *provided ) {
   if (provided)
     *provided = mpi_thread_provided;
   //_printf("Init_thread called\n");
+  mpi_init_status = 1;
   return 0;
 }
 //--------------------------------------------------------------------------------
 int MPI_Init( int *argc, char ***argv ) {
   //_printf("Init called\n");
+  mpi_init_status = 1;
   return 0;
 }
 //--------------------------------------------------------------------------------
 int MPI_Comm_size( MPI_Comm comm, int *size ) { 
-  *size = mpi_nodes;
+  if (comm == mpi_world)
+    *size = mpi_nodes;
+  else
+    return real_MPI_Comm_size(comm,size);
   return 0;
 }
 //--------------------------------------------------------------------------------
 int MPI_Comm_rank(MPI_Comm comm, int *rank) {
-  *rank = mpi_node;
+  if (comm == mpi_world)
+    *rank = mpi_node;
+  else
+    return real_MPI_Comm_rank(comm,rank);
   return 0;
 }
 //--------------------------------------------------------------------------------
@@ -998,7 +1041,90 @@ int MPI_Finalize( void ) {
   shm_exit();
 
   mpi_init = false;
+  mpi_init_status = 0;
+
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Initialized( int *flag ) {
+  *flag = mpi_init_status;
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Cart_create(MPI_Comm comm_old, int ndims, const int dims[],
+		    const int periods[], int reorder, MPI_Comm *comm_cart) {
+
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+
+}
+//--------------------------------------------------------------------------------
+int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count,
+		  MPI_Datatype datatype, MPI_Op op, MPI_Comm comm) {
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Cart_shift(MPI_Comm comm, int direction, int disp, int *rank_source,
+		   int *rank_dest) {
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Cart_rank(MPI_Comm comm, const int coords[], int *rank) {
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Cart_coords(MPI_Comm comm, int rank, int maxdims, int coords[]) {
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
+	     MPI_Comm comm) {
+
+  MPI_Request r;
+  MPI_Status s;
+  MPI_Isend(buf,count,datatype,dest,tag,comm,&r);
+  MPI_Wait(&r,&s);
   
   return 0;
 }
 //--------------------------------------------------------------------------------
+int MPI_Recv(void *buf, int count, MPI_Datatype datatype, int source, int tag,
+	     MPI_Comm comm, MPI_Status *status) {
+
+
+  MPI_Request r;
+  MPI_Status s;
+  MPI_Irecv(buf,count,datatype,source,tag,comm,&r);
+  MPI_Wait(&r,&s);
+  
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Waitall(int count, MPI_Request array_of_requests[], 
+		MPI_Status array_of_statuses[]) {
+
+  int i;
+  for (i=0;i<count;i++)
+    MPI_Wait(&array_of_requests[i],&array_of_statuses[i]);
+
+  return 0;
+}
+//--------------------------------------------------------------------------------
+int MPI_Bcast( void *buffer, int count, MPI_Datatype datatype, int root, 
+	       MPI_Comm comm ) {
+  fprintf(stderr,"Not implemented\n");
+  exit(1);
+  return 0;
+}
+//--------------------------------------------------------------------------------
+
+
